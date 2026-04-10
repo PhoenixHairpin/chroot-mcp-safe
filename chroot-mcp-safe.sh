@@ -1899,6 +1899,9 @@ if [ -s "/etc/resolv.conf" ]; then
 fi
 
 touch "$TARGET$CHROOT_MARKER"
+sync
+sleep 0.3  # 等待 mount propagation 稳定
+echo_info "挂载同步完成，准备执行 chroot 预检"
 prepare_chroot_compat
 CHROOT_EXEC_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:/apex/com.android.runtime/bin:/android_root/system/bin:/android_root/system/xbin:/android_root/apex/com.android.runtime/bin"
 ROOTFS_PRECHECK_SHELL="$(get_rootfs_chroot_shell)"
