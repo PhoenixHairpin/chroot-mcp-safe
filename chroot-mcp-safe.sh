@@ -5,7 +5,7 @@ set -o pipefail
 
 TERMUX_PREFIX="/data/data/com.termux/files/usr"
 export PATH="$TERMUX_PREFIX/bin:$TERMUX_PREFIX/sbin:$PATH"
-CHROOT_BIN="$TERMUX_PREFIX/bin/chroot"
+CHROOT_BIN="/system/bin/chroot"
 [ -x "$CHROOT_BIN" ] || CHROOT_BIN="$TERMUX_PREFIX/sbin/chroot"
 [ -x "$CHROOT_BIN" ] || CHROOT_BIN="$(command -v chroot 2>/dev/null || echo /system/bin/chroot)"
 
@@ -1385,6 +1385,7 @@ chroot_pid_alive_retry() {
   shell_path="$(get_rootfs_chroot_shell)"
   try=1
   while [ "$try" -le 3 ]; do
+    sync  # 同步 I/O 缓存
     output="$(chroot_cmd_capture "$shell_path" 'test -s /run/sshd.pid && pid=$(cat /run/sshd.pid 2>/dev/null) && kill -0 "$pid" 2>/dev/null')"
     rc=$?
     CHROOT_LAST_OUTPUT="$output"
@@ -1440,6 +1441,7 @@ run_chroot_cmd_retry() {
   shell_path="$(get_rootfs_chroot_shell)"
   try=1
   while [ "$try" -le "$max_try" ]; do
+    sync  # 同步 I/O 缓存
     output="$(chroot_cmd_capture "$shell_path" "$cmd")"
     rc=$?
     CHROOT_LAST_OUTPUT="$output"
@@ -1502,7 +1504,7 @@ prepare_and_start_sshd() {
     dump_chroot_exec_diagnostics "prepare_and_start_sshd直连探测" "127" "$direct_probe_out" "$shell_path"
   fi
 
-  run_chroot_cmd_retry "chroot入口预热" 'true' 5 1 1 || {
+  run_chroot_cmd_retry "chroot入口预热" 'true' 5 2 1 || {
     echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
 ' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   }
