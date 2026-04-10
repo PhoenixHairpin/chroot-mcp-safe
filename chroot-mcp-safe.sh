@@ -218,6 +218,58 @@ read_daemon_info() {
   return 0
 }
 
+# 扫描所有发行版并显示运行状态概览
+
+# 扫描所有发行版并显示运行状态概览
+show_all_containers_status() {
+  local distros="ubuntu debian arch fedora alpine"
+  local name file alive port pid target started
+  local running_count=0
+
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════════╗"
+  echo "║              容器运行状态概览                                ║"
+  echo "╠══════════════════════════════════════════════════════════════╣"
+
+  for name in $distros; do
+    file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${name}.info"
+    alive="no"
+    port="-"
+    pid="-"
+    target="-"
+    started="-"
+
+    if [ -f "$file" ]; then
+      DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+      if read_daemon_info "$file" 2>/dev/null; then
+        pid="${DAEMON_SSHD_PID:-}"
+        port="${DAEMON_PORT:-}"
+        target="${DAEMON_TARGET:-}"
+        started="${DAEMON_STARTED_AT:-}"
+        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+          alive="yes"
+          running_count=$((running_count + 1))
+        fi
+      fi
+    fi
+
+    if [ "$alive" = "yes" ]; then
+      printf "║  🟢 %-8s 运行中  PID=%-6s Port=%-5s %-20s ║\n" "$name" "$pid" "$port" "$started"
+    else
+      printf "║  ⚪ %-8s 未运行                                              ║\n" "$name"
+    fi
+  done
+
+  echo "╚══════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  if [ "$running_count" -gt 0 ]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
 daemon_status() {
   local file
   file="$(get_daemon_info_file)"
@@ -1002,8 +1054,57 @@ EOF
 }
 
 interactive_wizard() {
-  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs
-  action=$(choose_option "选择操作" "启动已存在rootfs" "下载rootfs后启动" "只打印安装建议")
+  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm
+  
+  # 显示容器运行状态概览
+  show_all_containers_status
+  
+  action=$(choose_option "选择操作" "启动已存在rootfs" "下载rootfs后启动" "安全终止卸载容器" "只打印安装建议")
+  
+  # 处理"安全终止卸载容器"选项
+  if [ "$action" = "安全终止卸载容器" ]; then
+    stop_distro=$(choose_option "选择要终止的发行版" ubuntu debian arch fedora alpine)
+    DISTRO_NAME="$stop_distro"
+    
+    # 检查该发行版是否正在运行
+    local stop_file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${stop_distro}.info"
+    if [ ! -f "$stop_file" ]; then
+      echo "该发行版未运行（无状态文件）" >&2
+      exit 0
+    fi
+    
+    # 清空之前读取的变量
+    DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+    if read_daemon_info "$stop_file"; then
+      if [ -n "${DAEMON_SSHD_PID:-}" ] && [ -d "/proc/${DAEMON_SSHD_PID}" ]; then
+        echo "" >&2
+        echo "发行版: $stop_distro" >&2
+        echo "PID: ${DAEMON_SSHD_PID}" >&2
+        echo "Port: ${DAEMON_PORT:-unknown}" >&2
+        echo "Target: ${DAEMON_TARGET:-unknown}" >&2
+        echo "启动时间: ${DAEMON_STARTED_AT:-unknown}" >&2
+        echo "" >&2
+        
+        stop_confirm=$(choose_option "确认终止并卸载?" "确认终止" "取消操作")
+        if [ "$stop_confirm" = "确认终止" ]; then
+          echo "[stop] 正在终止 ${stop_distro} 容器..." >&2
+          daemon_stop || { echo "[stop] 终止失败，请检查日志" >&2; exit 1; }
+          echo "[stop] ✅ ${stop_distro} 容器已安全终止并卸载" >&2
+        else
+          echo "已取消终止操作" >&2
+        fi
+      else
+        echo "该发行版状态文件存在但进程已结束，清理状态文件" >&2
+        rm -f "$stop_file" 2>/dev/null
+        echo "状态文件已清理" >&2
+      fi
+    else
+      echo "无法读取状态文件" >&2
+      rm -f "$stop_file" 2>/dev/null
+    fi
+    exit 0
+  fi
+  
   distro=$(choose_option "选择发行版" ubuntu debian arch fedora alpine)
   DISTRO_NAME="$distro"
   apply_distro_preset
