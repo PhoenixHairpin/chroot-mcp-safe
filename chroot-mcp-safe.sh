@@ -10,6 +10,23 @@ CHROOT_BIN="/system/bin/chroot"
 [ -x "$CHROOT_BIN" ] || CHROOT_BIN="$(command -v chroot 2>/dev/null || echo /system/bin/chroot)"
 
 # ==============================================
+
+# ==============================================
+# chroot-mcp-safe.sh - Android chroot 容器管理脚本
+# ==============================================
+# 版本: v2.1.0 (Android Binary Support Edition)
+# 日期: 2026-04-11
+# 状态: ✅ 生产可用 (已验证稳定运行)
+# ==============================================
+# 本版本新增功能 (相比 v2.0):
+#   1. ✅ Android 二进制支持: apex 使用 rbind 递归挂载
+#      - 解决: /system/bin/toybox, getprop, pm, am 等可正常运行
+#      - 解决: linkerconfig 挂载消除 linker 警告
+#   2. ✅ Binder IPC 支持: /dev/binderfs 挂载
+#      - 解决: pm, am, settings 等需要 Binder 的命令可运行
+#   3. ✅ do_mount 函数新增 rbind 类型支持
+#   4. ✅ cleanup 函数新增 linkerconfig/binderfs 卸载
+# ==============================================
 # 发布版整理说明
 # - 仅做注释/结构整理，不改变既有逻辑、行为与输出路径
 # - 以当前稳定版为基线，便于后续审阅、比对与长期维护
@@ -381,6 +398,7 @@ for m in \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
+  "$TARGET/linkerconfig" \
   "$TARGET/apex" \
   "$TARGET/system_ext" \
   "$TARGET/odm" \
@@ -398,6 +416,7 @@ for m in \
   "$TARGET/dev/shm" \
   "$TARGET/run" \
   "$TARGET/tmp" \
+  "$TARGET/dev/binderfs" \
   "$TARGET/dev/pts" \
   "$TARGET/dev" \
   "$TARGET/sys" \
@@ -517,6 +536,7 @@ for m in \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
+  "$TARGET/linkerconfig" \
   "$TARGET/apex" \
   "$TARGET/system_ext" \
   "$TARGET/odm" \
@@ -534,6 +554,7 @@ for m in \
   "$TARGET/dev/shm" \
   "$TARGET/run" \
   "$TARGET/tmp" \
+  "$TARGET/dev/binderfs" \
   "$TARGET/dev/pts" \
   "$TARGET/dev" \
   "$TARGET/sys" \
@@ -1701,6 +1722,15 @@ do_mount() {
         mount -o remount,bind,ro "$dst" 2>/dev/null || echo_err "回退只读失败: $dst"
       }
     fi
+  elif [ "$type" = "rbind" ]; then
+    mount --rbind "$src" "$dst" || echo_err "rbind挂载失败: $src -> $dst"
+
+    if [ -n "$opt" ]; then
+      mount -o "remount,bind,$opt" "$dst" || {
+        echo_warn "remount失败，回退只读: $dst"
+        mount -o remount,bind,ro "$dst" 2>/dev/null || echo_err "回退只读失败: $dst"
+      }
+    fi
   else
     mount -t "$type" -o "$opt" "$src" "$dst" || echo_err "挂载失败: $src -> $dst"
   fi
@@ -1864,6 +1894,12 @@ mkdir -p "$TARGET/dev/pts"
 chmod 1777 "$TARGET/dev/shm" 2>/dev/null || true
 do_mount "devpts" "$TARGET/dev/pts" "devpts" "nosuid,noexec,newinstance,ptmxmode=0666"
 
+# 添加 binderfs 以支持 Binder IPC（am/pm/settings 等 Android 命令需要）
+if [ -d "/dev/binderfs" ]; then
+  mkdir -p "$TARGET/dev/binderfs"
+  do_mount "/dev/binderfs" "$TARGET/dev/binderfs" "bind" "rw"
+fi
+
 do_mount "tmpfs" "$TARGET/tmp" "tmpfs" "nosuid,nodev,mode=1777"
 do_mount "tmpfs" "$TARGET/run" "tmpfs" "nosuid,nodev,mode=755,size=200M"
 do_mount "tmpfs" "$TARGET/dev/shm" "tmpfs" "nosuid,nodev,size=100M,mode=1777"
@@ -1989,8 +2025,13 @@ do_mount "$REAL_ODM" "$TARGET/odm" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_ODM" "$TARGET/android_odm" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_BOOT" "$TARGET/android_boot" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_SYSTEM_EXT" "$TARGET/system_ext" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_APEX" "$TARGET/apex" "bind" "$SYS_MOUNT_OPT"
+do_mount "$REAL_APEX" "$TARGET/apex" "rbind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_METADATA" "$TARGET/metadata" "bind" "$SYS_MOUNT_OPT"
+
+# 添加 linkerconfig 以支持 Android 动态链接器配置
+if [ -d "/linkerconfig" ]; then
+  do_mount "/linkerconfig" "$TARGET/linkerconfig" "bind" "ro"
+fi
 
 if [ -d "/storage/emulated/0" ]; then
   do_mount "/storage/emulated/0" "$TARGET/storage/emulated/0" "bind" "$SDCARD_MOUNT_OPT"
