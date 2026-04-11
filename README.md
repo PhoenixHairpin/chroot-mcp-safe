@@ -1,137 +1,187 @@
-# chroot-mcp-safe
+# chroot-mcp-safe.sh
 
-Android/Termux 下安全、可靠的 chroot 容器管理脚本。
+**Android chroot 容器管理脚本 - 生产可用版本**
 
-## 功能特性
+## 📌 当前版本
 
-### 核心能力
-- **原生 chroot**：不依赖 proot，直接使用 Linux chroot syscall
-- **mount namespace 隔离**：独立的挂载命名空间，不影响宿主系统
-- **ext4 镜像支持**：rootfs 可存储为 ext4 镜像文件，实现 `/data` 真 1:1 映射
-- **后台 daemon 模式**：支持后台启动 SSH 服务，不占用交互终端
+**v2.1.0 (Android Binary Support Edition)**  
+**日期: 2026-04-11**  
+**状态: ✅ 生产可用 (已验证稳定运行)**
 
-### 交互式管理
-- **状态概览显示**：启动时显示所有发行版容器运行状态
-- **安全终止卸载**：主菜单提供一键安全终止并卸载容器选项
-- **智能检测**：自动检测运行中容器、残留进程，提供多种操作选项
+---
 
-### 支持的发行版
-- Ubuntu (默认端口 8023)
-- Debian (端口 8024)
-- Arch Linux (端口 8025)
-- Fedora (端口 8026)
-- Alpine (端口 8027)
+## ✨ 本版本新功能
 
-## 快速开始
+相比 v2.0 版本，本版本新增以下重要功能：
 
-### 无参数启动（交互式向导）
+### 1. ✅ Android 二进制支持
+
+**问题**: 之前 chroot 内无法运行 `/system/bin/toybox`、`getprop`、`pm`、`am` 等原生 Android 命令，报错 "not found" 或 linker 警告。
+
+**解决方案**:
+- **apex 使用 `rbind` 递归挂载** - Android APEX 模块使用多层挂载结构，普通 `bind` 只能挂载顶层，`rbind` 可递归挂载所有子挂载点
+- **挂载 `/linkerconfig`** - 解决 Android 动态链接器的配置文件找不到问题，消除警告
+
+**效果**:
+```
+# 现在可以直接运行 Android 原生命令
+/system/bin/toybox --help      # 211 个内置命令
+/system/bin/getprop ro.product.model
+/system/bin/pm list packages   # 435 个应用
+/system/bin/logcat -d
+```
+
+### 2. ✅ Binder IPC 支持
+
+**问题**: `pm`、`am`、`settings`、`input` 等命令依赖 Binder IPC，报错 "Binder driver could not be opened"。
+
+**解决方案**:
+- **挂载 `/dev/binderfs`** - Binder 是 Android 的核心 IPC 机制，通过挂载 binderfs 使 chroot 内可以访问 Binder 设备
+
+**效果**:
 ```bash
-su -c /path/to/chroot-mcp-safe.sh
+# Binder 相关命令现在可正常运行
+/system/bin/pm list packages -3
+/system/bin/am start -a android.intent.action.VIEW
+/system/bin/settings get system screen_brightness
 ```
 
-启动时会显示容器状态概览：
-```
-╔══════════════════════════════════════════════════════════════╗
-║              容器运行状态概览                                ║
-╠══════════════════════════════════════════════════════════════╣
-║  🟢 ubuntu   运行中  PID=3488   Port=8023  2026-04-11 03:55:19 ║
-║  ⚪ debian   未运行                                              ║
-║  ⚪ arch     未运行                                              ║
-║  ⚪ fedora   未运行                                              ║
-║  ⚪ alpine   未运行                                              ║
-╚══════════════════════════════════════════════════════════════╝
-```
+### 3. ✅ do_mount 函数新增 rbind 类型
 
-主菜单选项：
-1. 启动已存在rootfs
-2. 下载rootfs后启动
-3. **安全终止卸载容器** ← 一键终止并清理
-4. 只打印安装建议
-
-### 后台模式启动
 ```bash
-# 启动 Ubuntu 后台容器
-su -c /path/to/chroot-mcp-safe.sh --daemon --distro ubuntu --full-access --permissive
+# 支持新的挂载类型
+do_mount "$REAL_APEX" "$TARGET/apex" "rbind" "$SYS_MOUNT_OPT"
+```
 
-# SSH 连接
+### 4. ✅ cleanup 函数完善
+
+新增卸载点：
+- `$TARGET/linkerconfig`
+- `$TARGET/dev/binderfs`
+
+---
+
+## 🔧 挂载点列表
+
+本脚本会挂载以下路径到 chroot 环境：
+
+| 源路径 | 目标路径 | 类型 | 说明 |
+|--------|---------|------|------|
+| `/` | `/android_root` | bind ro | 完整根目录视角 |
+| `/system` | `/system`, `/android_system` | bind ro | 系统分区 |
+| `/vendor` | `/vendor`, `/android_vendor` | bind ro | 厂商分区 |
+| `/product` | `/product`, `/android_product` | bind ro | 产品分区 |
+| `/odm` | `/odm`, `/android_odm` | bind ro | ODM 分区 |
+| `/system_ext` | `/system_ext` | bind ro | 系统扩展分区 |
+| `/data` | `/data`, `/android_data` | bind rw | 用户数据分区 |
+| `/apex` | `/apex` | **rbind ro** | APEX 模块 (递归) |
+| `/linkerconfig` | `/linkerconfig` | **bind ro** | 动态链接器配置 |
+| `/dev/binderfs` | `/dev/binderfs` | **bind rw** | Binder IPC |
+| `/metadata` | `/metadata` | bind ro | 元数据分区 |
+| `/storage/emulated/0` | `/sdcard`, `/storage/emulated/0` | bind rw | 内置存储 |
+
+---
+
+## 🚀 使用方法
+
+### 启动容器
+```bash
+# 后台启动 Ubuntu
+./chroot-mcp-safe.sh --daemon --distro ubuntu --full-access --permissive
+
+# SSH 连接 (端口 8023, 用户 root, 密码 123456)
 ssh root@<手机IP> -p 8023
-# 密码: 123456
 ```
 
 ### 查看状态
 ```bash
-su -c /path/to/chroot-mcp-safe.sh --status --distro ubuntu
+./chroot-mcp-safe.sh --status --distro ubuntu
 ```
 
 ### 停止容器
 ```bash
-# 命令行方式停止
-su -c /path/to/chroot-mcp-safe.sh --stop --distro ubuntu
-
-# 或在交互菜单选择「安全终止卸载容器」
+./chroot-mcp-safe.sh --stop --distro ubuntu
 ```
 
-## 命令行参数
+### 运行 Android 命令
+```bash
+# 进入 chroot 后
+/system/bin/getprop ro.build.version.release  # 获取 Android 版本
+/system/bin/pm list packages                   # 列出所有应用
+/system/bin/logcat -d                          # 查看日志
+```
 
-| 参数 | 说明 |
+### 绕过 root 检测运行程序
+```bash
+# 使用 runuser 切换到普通用户
+runuser -u testuser -- /path/to/program
+
+# 或创建普通用户后使用
+useradd -m -s /bin/bash myuser
+runuser -u myuser -- python3 /tmp/some_script.py
+```
+
+---
+
+## ✅ 验证测试
+
+### Android 命令测试
+| 命令 | 状态 | 说明 |
+|------|------|------|
+| `toybox` | ✅ | 211 个内置命令全部可用 |
+| `getprop` | ✅ | 无警告，正常输出 |
+| `pm` | ✅ | 可列出 435 个应用 |
+| `am` | ✅ | 可启动 Activity |
+| `settings` | ✅ | 可读写系统设置 |
+| `logcat` | ✅ | 可查看日志 |
+| `screenrecord` | ✅ | 可录制屏幕 |
+
+### 用户切换测试
+| 方法 | 状态 | 说明 |
+|------|------|------|
+| `su` | ❌ | 密码验证受限 |
+| `runuser` | ✅ | 推荐，可切换用户 |
+| `unshare --user` | ❌ | Android 内核不支持 |
+
+### 网络测试
+| 功能 | 状态 |
 |------|------|
-| `--interactive` | 强制进入交互式向导 |
-| `--daemon` | 后台模式：挂载并启动 SSH 后立即返回 |
-| `--status` | 查看后台容器状态 |
-| `--stop` | 停止后台容器并清理挂载 |
-| `--distro <名称>` | 指定发行版 (ubuntu/debian/arch/fedora/alpine) |
-| `--rootfs <目录>` | 指定自定义 rootfs 路径 |
-| `--full-access` | 全权限模式：/data 和存储可写（默认） |
-| `--safe` | 安全模式：/data 和存储只读 |
-| `--permissive` | 临时设置 SELinux 为 Permissive |
-| `--ro-data` | /data 只读挂载 |
-| `--proot-fallback` | chroot 失败时回退到 proot |
-| `--migrate` | 将 rootfs 迁移到标准路径 |
-| `--migrate-image` | 将 rootfs 迁移为 ext4 镜像 |
+| DNS 解析 | ✅ (8.8.8.8) |
+| wget | ✅ |
+| apt update | ✅ |
 
-## 镜像模式优势
+---
 
-当 rootfs 位于 `/data` 子树下时，通过 ext4 镜像可实现：
-- `/data` 目录的真 1:1 映射（避免递归自绑定问题）
-- 更好的隔离性和稳定性
-- 镜像文件可独立备份和迁移
+## 📋 已修复的历史问题
 
-镜像存储路径：`/data/local/chroot-images/<distro>.img`
-挂载点：`/mnt/chroot-rootfs/<distro>`
+1. **假性 ENOENT 间歇性失败** - mount propagation 未完全稳定导致动态链接器找不到库文件
+   - 修复: 使用系统 chroot + sync + sleep 等待
+2. **Android 二进制无法运行** - apex/linkerconfig 未正确挂载
+   - 修复: rbind 递归挂载 apex + 挂载 linkerconfig
+3. **Binder 命令失败** - 缺少 binderfs 挂载
+   - 修复: 挂载 /dev/binderfs
 
-## 安全特性
+---
 
-- **宿主 SSH 保护**：停止容器时不会误停 Termux SSH (端口 8022)
-- **SELinux 处理**：自动检测并可选临时切换到 Permissive
-- **挂载传播锁定**：所有挂载点设置为 private，避免泄漏到宿主
-- **优雅终止**：先 TERM 再 KILL，确保进程正确退出
-- **残留检测**：自动检测并处理残留挂载和进程
+## 📂 文件位置
 
-## 已修复问题
+- **脚本**: `/data/user/0/com.termux/files/home/chroot-mcp-safe.sh`
+- **镜像**: `/data/local/chroot-images/ubuntu.img` (约 918MB)
+- **挂载点**: `/mnt/chroot-rootfs/ubuntu`
+- **状态文件**: `/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-ubuntu.info`
+- **日志**: `/data/data/com.termux/files/usr/tmp/chroot-mcp-*.log`
 
-### "假性 ENOENT" 问题
-- **现象**：chroot 命令间歇性报 "No such file or directory"，但文件实际存在
-- **根因**：mount propagation 未完全稳定时，动态链接器找不到库文件
-- **修复**：
-  1. 强制使用系统 chroot (`/system/bin/chroot`)
-  2. 挂载完成后执行 `sync` + `sleep 0.3` 等待稳定
-  3. retry 等待时间增加到 2 秒
+---
 
-## 环境要求
+## ⚠️ 重要约束
 
-- Android 设备，已 root (KernelSU/Magisk)
-- Termux 环境
-- 已安装的 Linux rootfs（可通过 proot-distro 或手动下载）
+- 宿主 SSH 端口 **8022** 必须始终可用，脚本不会影响此端口
+- chroot SSH 端口 **8023** 用于容器访问
+- 设备重启/断电后 runtime mount 自动消失，需重新启动
 
-## 文件路径
+---
 
-| 文件 | 路径 |
-|------|------|
-| 主脚本 | `/data/user/0/com.termux/files/home/chroot-mcp-safe.sh` |
-| 状态文件 | `/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-<distro>.info` |
-| 日志文件 | `/data/data/com.termux/files/usr/tmp/chroot-mcp-<timestamp>.log` |
-| 镜像文件 | `/data/local/chroot-images/<distro>.img` |
+## 🔗 GitHub 仓库
 
-## License
+https://github.com/PhoenixHairpin/chroot-mcp-safe
 
-MIT
