@@ -14,12 +14,20 @@ CHROOT_BIN="/system/bin/chroot"
 # ==============================================
 # chroot-mcp-safe.sh - Android chroot 容器管理脚本
 # ==============================================
-# 版本: v2.1.0 (Android Binary Support Edition)
+# 版本: v2.1.1 (Safe Edition)
 # 日期: 2026-04-11
 # 状态: ✅ 生产可用 (已验证稳定运行)
 # ==============================================
 # 本版本新增功能 (相比 v2.0):
 #   1. ✅ Android 二进制支持: apex 使用 rbind 递归挂载
+#      - 解决: /system/bin/toybox, getprop, pm, am 等可正常运行
+#      - 解决: linkerconfig 挂载消除 linker 警告
+#   2. ✅ Binder IPC 支持: /dev/binderfs 挂载
+#      - 解决: pm, am, settings 等需要 Binder 的命令可运行
+#   3. ✅ do_mount 函数新增 rbind 类型支持
+#   4. ✅ cleanup 函数新增 linkerconfig/binderfs 卸载
+#   5. ⚠️ Loop 设备清理: cleanup 函数确保正确释放
+#      - 说明: Android losetup 不支持 --autoclear，依赖 namespace 隔离
 #      - 解决: /system/bin/toybox, getprop, pm, am 等可正常运行
 #      - 解决: linkerconfig 挂载消除 linker 警告
 #   2. ✅ Binder IPC 支持: /dev/binderfs 挂载
@@ -47,7 +55,7 @@ fi
 DISTRO_NAME=""
 PRINT_INSTALL_GUIDE=0
 INTERACTIVE_MODE=0
-LOG_FILE="/data/data/com.termux/files/usr/tmp/chroot-mcp-$(date +%s).log"
+LOG_FILE="${LOG_FILE:-/data/data/com.termux/files/usr/tmp/chroot-mcp-$(date +%s).log}"
 
 HOST_ROOT_OPT="ro"
 SYS_MOUNT_OPT="ro,nosuid"
@@ -333,27 +341,135 @@ collect_mountpoint_users_in_current_ns() {
   done | sort -u
 }
 
+summarize_pid_cmdlines() {
+  local p pid out=""
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    [ -d "/proc/$pid" ] || continue
+    p=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    [ -z "$p" ] && p="[$(cat "/proc/$pid/comm" 2>/dev/null || echo unknown)]"
+    out+="${out:+ ; }${pid}:$p"
+  done
+  printf '%s' "$out"
+}
+
+list_loop_devices_for_image() {
+  local image_file="$1"
+  [ -n "$image_file" ] || return 0
+  /data/data/com.termux/files/usr/bin/losetup -j "$image_file" 2>/dev/null | awk -F: '{print $1}' | xargs 2>/dev/null || true
+}
+
+log_mountpoint_evidence() {
+  local tag="$1" mp="$2"
+  local users user_cmds line
+  [ -n "$mp" ] || return 0
+  line=$(grep -F " $mp " /proc/self/mountinfo 2>/dev/null | tail -1 || true)
+  users=$(collect_mountpoint_users_in_current_ns "$mp" | xargs 2>/dev/null || true)
+  user_cmds=$(summarize_pid_cmdlines $users)
+  log "[EVIDENCE][$tag] mountpoint=$mp mounted=$([ -n "$line" ] && echo yes || echo no) users=${users:-none} user_cmds=${user_cmds:-none}"
+  [ -n "$line" ] && log "[EVIDENCE][$tag] mountinfo=$line"
+}
+
+log_loopdev_evidence() {
+  local tag="$1" loopdev="$2"
+  local info backing
+  [ -n "$loopdev" ] || return 0
+  info=$(/data/data/com.termux/files/usr/bin/losetup "$loopdev" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
+  backing=$(basename "$loopdev")
+  backing=$(cat "/sys/block/${backing##*/}/loop/backing_file" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
+  log "[EVIDENCE][$tag] loopdev=$loopdev info=${info:-none} backing=${backing:-unknown}"
+}
+
+umount_with_evidence() {
+  local mp="$1"
+  local tag="${2:-umount}"
+  [ -n "$mp" ] || return 0
+  if ! is_mounted "$mp"; then
+    log "[EVIDENCE][$tag] mountpoint=$mp already_unmounted"
+    return 0
+  fi
+  log_mountpoint_evidence "$tag:before" "$mp"
+  if umount "$mp" 2>/dev/null; then
+    log "[EVIDENCE][$tag] umount_ok mountpoint=$mp"
+    return 0
+  fi
+  log "[EVIDENCE][$tag] umount_failed mountpoint=$mp fallback=lazy"
+  if umount -l "$mp" 2>/dev/null; then
+    log "[EVIDENCE][$tag] umount_lazy_ok mountpoint=$mp"
+    return 0
+  fi
+  log "[EVIDENCE][$tag] umount_lazy_failed mountpoint=$mp"
+  log_mountpoint_evidence "$tag:after_fail" "$mp"
+  return 1
+}
+
+detach_loop_with_evidence() {
+  local loopdev="$1"
+  local tag="${2:-loop_detach}"
+  [ -n "$loopdev" ] || return 0
+  log_loopdev_evidence "$tag:before" "$loopdev"
+  if /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null; then
+    log "[EVIDENCE][$tag] detach_ok loopdev=$loopdev"
+    return 0
+  fi
+  log "[EVIDENCE][$tag] detach_failed loopdev=$loopdev"
+  log_loopdev_evidence "$tag:after_fail" "$loopdev"
+  return 1
+}
+
+cleanup_stale_loop_devices_for_image() {
+  local image_file="$1"
+  local mountpoint="$2"
+  local loops loopdev users
+  [ -n "$image_file" ] || return 0
+  loops=$(list_loop_devices_for_image "$image_file")
+  [ -n "$loops" ] || return 0
+
+  for loopdev in $loops; do
+    if [ -n "$mountpoint" ] && grep -Fq " $mountpoint " /proc/self/mountinfo 2>/dev/null; then
+      users=$(collect_mountpoint_users_in_current_ns "$mountpoint" | xargs 2>/dev/null || true)
+      if [ -n "$users" ]; then
+        echo_warn "检测到镜像挂载点仍被当前命名空间进程使用，跳过残留 loop 清理: $mountpoint users=$users loop=$loopdev"
+        log_mountpoint_evidence "stale_loop_skip_busy" "$mountpoint"
+        log_loopdev_evidence "stale_loop_skip_busy" "$loopdev"
+        continue
+      fi
+      echo_warn "检测到镜像挂载点仍存在但无进程使用，先卸载再释放 loop: $mountpoint ($loopdev)"
+      umount_with_evidence "$mountpoint" "stale_loop_mount_cleanup"
+    else
+      echo_warn "检测到镜像残留 loop 绑定，尝试释放: $loopdev -> $image_file"
+      log_loopdev_evidence "stale_loop_orphan" "$loopdev"
+    fi
+    detach_loop_with_evidence "$loopdev" "stale_loop_detach"
+  done
+}
+
 cleanup_current_namespace_stale_image_mount() {
   set_image_paths
   [ -f "$IMAGE_FILE" ] || return 0
-  grep -Fq " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null || return 0
 
-  local users loopdev
-  users=$(collect_mountpoint_users_in_current_ns "$IMAGE_MOUNTPOINT" | xargs 2>/dev/null || true)
-  if [ -n "$users" ]; then
-    echo_warn "检测到当前命名空间已有镜像挂载且仍被进程使用，保留: $IMAGE_MOUNTPOINT users=$users"
-    return 0
+  if grep -Fq " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null; then
+    local users loopdev
+    users=$(collect_mountpoint_users_in_current_ns "$IMAGE_MOUNTPOINT" | xargs 2>/dev/null || true)
+    if [ -n "$users" ]; then
+      echo_warn "检测到当前命名空间已有镜像挂载且仍被进程使用，保留: $IMAGE_MOUNTPOINT users=$users"
+      log_mountpoint_evidence "stale_image_mount_busy" "$IMAGE_MOUNTPOINT"
+      cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
+      return 0
+    fi
+
+    loopdev=$(grep -F " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
+    case "$loopdev" in
+      /dev/loop*|/dev/block/loop*) ;;
+      *) loopdev="" ;;
+    esac
+
+    echo_warn "检测到当前命名空间残留镜像挂载，执行清理: $IMAGE_MOUNTPOINT ${loopdev:+($loopdev)}"
+    umount_with_evidence "$IMAGE_MOUNTPOINT" "stale_image_mount_cleanup"
+    [ -n "$loopdev" ] && detach_loop_with_evidence "$loopdev" "stale_image_mount_detach" || true
   fi
 
-  loopdev=$(grep -F " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
-  case "$loopdev" in
-    /dev/loop*|/dev/block/loop*) ;;
-    *) loopdev="" ;;
-  esac
-
-  echo_warn "检测到当前命名空间残留镜像挂载，执行清理: $IMAGE_MOUNTPOINT ${loopdev:+($loopdev)}"
-  umount "$IMAGE_MOUNTPOINT" 2>/dev/null || umount -l "$IMAGE_MOUNTPOINT" 2>/dev/null || true
-  [ -n "$loopdev" ] && /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+  cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
 }
 
 daemon_stop() {
@@ -369,7 +485,7 @@ daemon_stop() {
   [ -d "/proc/${DAEMON_SSHD_PID}" ] || { echo "[stop] sshd pid 不存在: ${DAEMON_SSHD_PID}"; rm -f "$file"; return 1; }
 
   echo "[stop] 进入 mount namespace 清理: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET}"
-  nsenter -t "$DAEMON_SSHD_PID" -m /data/data/com.termux/files/usr/bin/bash -s -- "$DAEMON_TARGET" "$DAEMON_SSHD_PID" "${DAEMON_IMAGE_LOOPDEV:-}" <<'EOS'
+  nsenter -t "$DAEMON_SSHD_PID" -m -- /data/data/com.termux/files/usr/bin/bash -s -- "$DAEMON_TARGET" "$DAEMON_SSHD_PID" "${DAEMON_IMAGE_LOOPDEV:-}" <<'EOS'
 TARGET="$1"
 PID="$2"
 LOOPDEV="$3"
@@ -422,7 +538,14 @@ for m in \
   "$TARGET/sys" \
   "$TARGET/proc"
   do
-  umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+  case "$m" in
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+      umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
+      ;;
+    *)
+      umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+      ;;
+  esac
 done
 rm -f "$TARGET/.chroot_marker" 2>/dev/null || true
 umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null || true
@@ -435,6 +558,7 @@ EOS
     host_users=$(collect_mountpoint_users_in_current_ns "${DAEMON_TARGET}" | xargs 2>/dev/null || true)
     if [ -n "$host_users" ]; then
       echo "[stop] 当前命名空间仍有进程使用挂载点，跳过宿主残留清理: ${DAEMON_TARGET} users=$host_users"
+      log_mountpoint_evidence "daemon_stop_host_busy" "${DAEMON_TARGET}"
     else
       host_loopdev=$(grep -F " ${DAEMON_TARGET} " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
       case "$host_loopdev" in
@@ -442,8 +566,9 @@ EOS
         *) host_loopdev="" ;;
       esac
       echo "[stop] 清理当前命名空间残留镜像挂载: ${DAEMON_TARGET} ${host_loopdev}"
-      umount "${DAEMON_TARGET}" 2>/dev/null || umount -l "${DAEMON_TARGET}" 2>/dev/null || true
+      quick_lazy_umount "${DAEMON_TARGET}"
       [ -n "$host_loopdev" ] && /data/data/com.termux/files/usr/bin/losetup -d "$host_loopdev" 2>/dev/null || true
+      [ -n "${DAEMON_IMAGE_FILE:-}" ] && cleanup_stale_loop_devices_for_image "${DAEMON_IMAGE_FILE}" "${DAEMON_TARGET}" || true
     fi
   fi
 
@@ -507,7 +632,7 @@ stop_runtime_by_pid_target() {
   [ -d "/proc/$ns_pid" ] || { echo "[stop] 目标 pid 不存在: $ns_pid"; return 1; }
 
   echo "[stop] 进入 mount namespace 清理(${label}): pid=${ns_pid} target=${target}"
-  nsenter -t "$ns_pid" -m /data/data/com.termux/files/usr/bin/bash -s -- "$target" "$ns_pid" "$loopdev" <<'EOS'
+  nsenter -t "$ns_pid" -m -- /data/data/com.termux/files/usr/bin/bash -s -- "$target" "$ns_pid" "$loopdev" <<'EOS'
 TARGET="$1"
 PID="$2"
 LOOPDEV="$3"
@@ -560,7 +685,14 @@ for m in \
   "$TARGET/sys" \
   "$TARGET/proc"
   do
-  umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+  case "$m" in
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+      umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
+      ;;
+    *)
+      umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true
+      ;;
+  esac
 done
 rm -f "$TARGET/.chroot_marker" 2>/dev/null || true
 umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null || true
@@ -573,6 +705,7 @@ EOS
     host_users=$(collect_mountpoint_users_in_current_ns "${target}" | xargs 2>/dev/null || true)
     if [ -n "$host_users" ]; then
       echo "[stop] 当前命名空间仍有进程使用挂载点，跳过宿主残留清理: ${target} users=$host_users"
+      log_mountpoint_evidence "stop_runtime_host_busy" "${target}"
     else
       host_loopdev=$(grep -F " ${target} " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
       case "$host_loopdev" in
@@ -580,8 +713,9 @@ EOS
         *) host_loopdev="$loopdev" ;;
       esac
       echo "[stop] 清理当前命名空间残留挂载: ${target} ${host_loopdev}"
-      umount "${target}" 2>/dev/null || umount -l "${target}" 2>/dev/null || true
+      quick_lazy_umount "${target}"
       [ -n "$host_loopdev" ] && /data/data/com.termux/files/usr/bin/losetup -d "$host_loopdev" 2>/dev/null || true
+      [ -n "$host_loopdev" ] && [ -f "${IMAGE_FILE:-}" ] && cleanup_stale_loop_devices_for_image "${IMAGE_FILE}" "${target}" || true
     fi
   fi
 
@@ -614,14 +748,27 @@ mount_rootfs_image_if_exists() {
 
   mkdir -p /data/local/chroot-images "$IMAGE_MOUNTPOINT" || echo_err "无法创建镜像目录/挂载点"
 
+  cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
+
   if grep -Fq " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null; then
+    local users existing_loop
+    users=$(collect_mountpoint_users_in_current_ns "$IMAGE_MOUNTPOINT" | xargs 2>/dev/null || true)
+    existing_loop=$(grep -F " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
+    if [ -n "$users" ]; then
+      echo_warn "检测到当前命名空间已有镜像挂载且被进程使用，拒绝抢占: $IMAGE_MOUNTPOINT users=$users"
+      log_mountpoint_evidence "image_mount_busy" "$IMAGE_MOUNTPOINT"
+      [ -n "$existing_loop" ] && log_loopdev_evidence "image_mount_busy" "$existing_loop"
+      echo_err "检测到目标镜像挂载仍被当前命名空间进程使用，请先退出旧实例后再重试"
+    fi
     echo_warn "检测到当前命名空间已有镜像挂载，先在本命名空间卸载后重新挂载，以确保 loop 设备由本实例独占管理"
-    umount "$IMAGE_MOUNTPOINT" 2>/dev/null || umount -l "$IMAGE_MOUNTPOINT" 2>/dev/null || true
+    umount_with_evidence "$IMAGE_MOUNTPOINT" "image_mount_reclaim"
+    cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
   fi
 
   IMAGE_LOOPDEV=$(/data/data/com.termux/files/usr/bin/losetup -f --show "$IMAGE_FILE" 2>/dev/null) || { echo "错误: 镜像 loop 绑定失败: $IMAGE_FILE" >&2; exit 1; }
+  log_loopdev_evidence "image_mount_attach" "$IMAGE_LOOPDEV"
   mount -t ext4 "$IMAGE_LOOPDEV" "$IMAGE_MOUNTPOINT" || {
-    /data/data/com.termux/files/usr/bin/losetup -d "$IMAGE_LOOPDEV" 2>/dev/null || true
+    detach_loop_with_evidence "$IMAGE_LOOPDEV" "image_mount_attach_fail"
     echo "错误: 镜像挂载失败: $IMAGE_FILE -> $IMAGE_MOUNTPOINT" >&2
     exit 1
   }
@@ -1040,7 +1187,7 @@ find_existing_rootfs() {
 print_install_guide() {
   local distro="${DISTRO_NAME:-ubuntu}"
   cat <<EOF
-[安装建议] 面向“高权限 + 编译能力”优先
+[安装建议] 面向"高权限 + 编译能力"优先
 
 推荐优先级:
   1) Ubuntu 24.04 / Debian 12  (兼容性最稳，工具链最全)
@@ -1430,10 +1577,7 @@ ensure_rootfs_sshd_port() {
     if grep -qiE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$cfg"; then
       sed -i -E "0,/^[[:space:]]*Port[[:space:]]+[0-9]+/s//Port ${want_port}/" "$cfg" 2>/dev/null || true
     else
-      printf '
-# added by chroot-mcp-safe
-Port %s
-' "$want_port" >> "$cfg"
+      printf '\n# added by chroot-mcp-safe\nPort %s\n' "$want_port" >> "$cfg"
     fi
     echo_info "已将 rootfs sshd 端口规范为: $want_port ($(get_rootfs_name))"
   fi
@@ -1527,8 +1671,7 @@ dump_chroot_exec_diagnostics() {
 
   {
     echo "context=$context rc=$rc target=$TARGET shell=$shell_path image_mode=$IMAGE_MODE image_file=${IMAGE_FILE:-} loop=${IMAGE_LOOPDEV:-}"
-    echo "stderr=$(printf '%s' "$output" | tr '
-' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo "stderr=$(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
     for item in \
       / \
       /bin /bin/sh /bin/bash \
@@ -1573,8 +1716,7 @@ run_chroot_cmd_retry() {
       return 0
     fi
 
-    echo_warn "$context 第${try}/${max_try}次失败(rc=$rc, shell=$shell_path): $(printf '%s' "$output" | tr '
-' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "$context 第${try}/${max_try}次失败(rc=$rc, shell=$shell_path): $(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
     [ "$diag_on_fail" = "1" ] && [ "$try" -eq "$max_try" ] && dump_chroot_exec_diagnostics "${context}#${try}" "$rc" "$output" "$shell_path"
 
     [ "$try" -lt "$max_try" ] && sleep "$sleep_s"
@@ -1627,14 +1769,12 @@ prepare_and_start_sshd() {
   fi
 
   run_chroot_cmd_retry "chroot入口预热" 'true' 5 2 1 || {
-    echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
-' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   }
 
   run_chroot_cmd_retry "sshd配置预检" "mkdir -p /run/sshd && chmod 755 /run/sshd && if command -v ssh-keygen >/dev/null 2>&1; then ssh-keygen -A >/dev/null 2>&1 || true; fi && $sshd_bin -t" 5 1 1
   if [ $? -ne 0 ]; then
-    echo_warn "sshd配置预检有告警: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
-' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "sshd配置预检有告警: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   fi
 
   if ! chroot_pid_alive_retry; then
@@ -1648,14 +1788,12 @@ prepare_and_start_sshd() {
 
   if chroot_pid_alive_retry; then
     run_chroot_cmd_retry "读取sshd pid" 'cat /run/sshd.pid 2>/dev/null' 3 1 0 >/dev/null 2>&1 || true
-    ROOTFS_SSHD_PID=$(printf '%s' "$CHROOT_LAST_OUTPUT" | tr -d '
-')
+    ROOTFS_SSHD_PID=$(printf '%s' "$CHROOT_LAST_OUTPUT" | tr -d '\n')
     SSHD_RUNNING=1
     echo_info "SSH自检: 已准备 /run/sshd，sshd运行中 (Port: $port)"
   else
     SSHD_RUNNING=0
-    echo_warn "SSH自检: 已尝试启动 sshd，但未确认存活 (Port: $port)，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
-' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "SSH自检: 已尝试启动 sshd，但未确认存活 (Port: $port)，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   fi
 }
 
