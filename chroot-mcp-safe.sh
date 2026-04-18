@@ -88,6 +88,7 @@ IMAGE_MODE=0
 IMAGE_FILE=""
 IMAGE_MOUNTPOINT=""
 IMAGE_LOOPDEV=""
+IMAGE_SIZE_GB=""
 ROOTFS_EXPLICIT=0
 ORIG_ARGC=$#
 ORIG_ARGS=("$@")
@@ -184,9 +185,14 @@ while [ $# -gt 0 ]; do
       AUTO_MIGRATE_IMAGE=1
       shift
       ;;
+    --image-size-gb)
+      [ $# -lt 2 ] && { echo "错误: --image-size-gb 需要一个正整数参数(单位GB)" >&2; exit 2; }
+      IMAGE_SIZE_GB="$2"
+      shift 2
+      ;;
     --help|-h)
       cat <<USAGE
-用法: $0 [--interactive] [--daemon] [--status] [--stop] [--migrate] [--auto-migrate] [--migrate-image] [--auto-migrate-image] [--safe|--full-access] [--permissive] [--ro-data] [--distro <名称>] [--rootfs <目录>] [--proot-fallback] [--print-install]
+用法: $0 [--interactive] [--daemon] [--status] [--stop] [--migrate] [--auto-migrate] [--migrate-image] [--auto-migrate-image] [--image-size-gb <GB>] [--safe|--full-access] [--permissive] [--ro-data] [--distro <名称>] [--rootfs <目录>] [--proot-fallback] [--print-install]
   --interactive     交互式向导（选择发行版/下载rootfs/启动参数）
   --daemon          后台模式：挂载并启动 chroot 内 sshd 后立即返回，不进入交互shell
   --status          查看后台模式状态（不新建挂载）
@@ -195,6 +201,7 @@ while [ $# -gt 0 ]; do
   --auto-migrate    启动前若发现 rootfs 位于 /data/..termux.. 内，则自动迁移到 /data/local/chroot/<distro>
   --migrate-image   将当前 rootfs 迁移为 ext4 镜像，并在运行时挂载到 /mnt/chroot-rootfs/<distro>
   --auto-migrate-image  启动前若 rootfs 位于 /data 子树内且镜像不存在，则自动迁移为 ext4 镜像，以实现 /data 真1:1 映射
+  --image-size-gb <GB>  设置镜像目标大小(GB)；未指定默认20GB，且不足时会自动提升到最小所需大小
   --safe            安全模式：/data 与 /storage/emulated/0 只读；系统分区保持只读
   --full-access     全权限模式：/data 与 /storage/emulated/0 可写（默认）
   --permissive      临时 setenforce 0，退出自动恢复
@@ -348,7 +355,7 @@ summarize_pid_cmdlines() {
     [ -d "/proc/$pid" ] || continue
     p=$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
     [ -z "$p" ] && p="[$(cat "/proc/$pid/comm" 2>/dev/null || echo unknown)]"
-    out+="${out:+ ; }${pid}:$p"
+    out+="${out:+ ; }${pid}:${p}"
   done
   printf '%s' "$out"
 }
@@ -742,6 +749,29 @@ set_image_paths() {
   IMAGE_MOUNTPOINT="/mnt/chroot-rootfs/${name}"
 }
 
+resolve_image_size_mib() {
+  local requested_gb="$1"
+  local min_mib="$2"
+  local requested_mib=""
+
+  if [ -z "$requested_gb" ]; then
+    requested_gb=20
+  fi
+
+  if ! [[ "$requested_gb" =~ ^[0-9]+$ ]] || [ "$requested_gb" -le 0 ]; then
+    echo "[migrate-image] 非法镜像大小: ${requested_gb} GB（必须是正整数）" >&2
+    return 1
+  fi
+
+  requested_mib=$(( requested_gb * 1024 ))
+  if [ "$requested_mib" -lt "$min_mib" ]; then
+    echo_warn "[migrate-image] 指定大小 ${requested_gb} GB 小于最小所需 $(( (min_mib + 1023) / 1024 )) GB，已自动提升"
+    requested_mib="$min_mib"
+  fi
+
+  echo "$requested_mib"
+}
+
 mount_rootfs_image_if_exists() {
   set_image_paths
   [ -f "$IMAGE_FILE" ] || return 0
@@ -779,7 +809,7 @@ mount_rootfs_image_if_exists() {
 
 migrate_rootfs_to_image() {
   local src="$TARGET"
-  local tmpimg loopdev bytes need_bytes size_mib
+  local tmpimg loopdev bytes need_bytes min_size_mib size_mib
 
   [ -d "$src" ] || { echo "[migrate-image] 源 rootfs 不存在: $src"; return 1; }
   set_image_paths
@@ -793,11 +823,13 @@ migrate_rootfs_to_image() {
   bytes=$(du -sb "$src" 2>/dev/null | awk '{print $1}')
   [ -z "$bytes" ] && bytes=0
   need_bytes=$(( bytes + bytes / 3 + 268435456 ))
-  size_mib=$(( (need_bytes + 1048575) / 1048576 ))
+  min_size_mib=$(( (need_bytes + 1048575) / 1048576 ))
+  size_mib=$(resolve_image_size_mib "$IMAGE_SIZE_GB" "$min_size_mib") || return 1
   tmpimg="${IMAGE_FILE}.tmp"
 
   echo "[migrate-image] 源: $src"
   echo "[migrate-image] 镜像: $IMAGE_FILE"
+  echo "[migrate-image] 最小需求: ${min_size_mib} MiB"
   echo "[migrate-image] 申请大小: ${size_mib} MiB"
 
   rm -f "$tmpimg" 2>/dev/null || true
@@ -970,6 +1002,12 @@ check_residual_state() {
   fi
 
   set_image_paths
+  if [ "$daemon_alive" -eq 0 ] \
+     && ! grep -Fq " $TARGET " /proc/self/mountinfo 2>/dev/null \
+     && { [ -z "${IMAGE_MOUNTPOINT:-}" ] || [ "$IMAGE_MOUNTPOINT" = "$TARGET" ] || ! grep -Fq " $IMAGE_MOUNTPOINT " /proc/self/mountinfo 2>/dev/null; }; then
+    return 0
+  fi
+
   target_pids="$(collect_pids_by_root_prefix "$TARGET")"
   if [ -n "${IMAGE_MOUNTPOINT:-}" ] && [ "$IMAGE_MOUNTPOINT" != "$TARGET" ]; then
     image_pids="$(collect_pids_by_root_prefix "$IMAGE_MOUNTPOINT")"
@@ -1187,7 +1225,7 @@ find_existing_rootfs() {
 print_install_guide() {
   local distro="${DISTRO_NAME:-ubuntu}"
   cat <<EOF
-[安装建议] 面向"高权限 + 编译能力"优先
+[安装建议] 面向“高权限 + 编译能力”优先
 
 推荐优先级:
   1) Ubuntu 24.04 / Debian 12  (兼容性最稳，工具链最全)
@@ -1222,7 +1260,7 @@ EOF
 }
 
 interactive_wizard() {
-  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm
+  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm image_size_input
   
   # 显示容器运行状态概览
   show_all_containers_status
@@ -1310,6 +1348,16 @@ interactive_wizard() {
       echo "开始下载并解压rootfs到: $TARGET" >&2
       download_rootfs_archive "$url" "$TARGET" || { echo "错误: rootfs下载/解压失败" >&2; exit 2; }
     fi
+
+    image_size_input=$(ask_text "输入镜像大小GB(留空默认20)")
+    if [ -n "$image_size_input" ]; then
+      if ! [[ "$image_size_input" =~ ^[0-9]+$ ]] || [ "$image_size_input" -le 0 ]; then
+        echo "错误: 镜像大小必须是正整数GB" >&2
+        exit 2
+      fi
+      IMAGE_SIZE_GB="$image_size_input"
+    fi
+    AUTO_MIGRATE_IMAGE=1
   fi
 
   permissive_choice=$(choose_option "SELinux模式" "permissive(推荐)" "保持当前")
@@ -1345,6 +1393,8 @@ if [ "$INTERACTIVE_MODE" -eq 1 ]; then
     ORIG_ARGS=()
     [ -n "${DISTRO_NAME:-}" ] && ORIG_ARGS+=(--distro "$DISTRO_NAME")
     [ -n "${TARGET:-}" ] && ORIG_ARGS+=(--rootfs "$TARGET")
+    [ -n "${IMAGE_SIZE_GB:-}" ] && ORIG_ARGS+=(--image-size-gb "$IMAGE_SIZE_GB")
+    [ "$AUTO_MIGRATE_IMAGE" -eq 1 ] && ORIG_ARGS+=(--auto-migrate-image)
     [ "$PERMISSIVE" -eq 1 ] && ORIG_ARGS+=(--permissive)
     [ "$RO_DATA" -eq 1 ] && ORIG_ARGS+=(--ro-data)
     if [ "$SAFE_MODE" -eq 1 ]; then
@@ -1577,7 +1627,10 @@ ensure_rootfs_sshd_port() {
     if grep -qiE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$cfg"; then
       sed -i -E "0,/^[[:space:]]*Port[[:space:]]+[0-9]+/s//Port ${want_port}/" "$cfg" 2>/dev/null || true
     else
-      printf '\n# added by chroot-mcp-safe\nPort %s\n' "$want_port" >> "$cfg"
+      printf '
+# added by chroot-mcp-safe
+Port %s
+' "$want_port" >> "$cfg"
     fi
     echo_info "已将 rootfs sshd 端口规范为: $want_port ($(get_rootfs_name))"
   fi
@@ -1671,7 +1724,8 @@ dump_chroot_exec_diagnostics() {
 
   {
     echo "context=$context rc=$rc target=$TARGET shell=$shell_path image_mode=$IMAGE_MODE image_file=${IMAGE_FILE:-} loop=${IMAGE_LOOPDEV:-}"
-    echo "stderr=$(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo "stderr=$(printf '%s' "$output" | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
     for item in \
       / \
       /bin /bin/sh /bin/bash \
@@ -1716,7 +1770,8 @@ run_chroot_cmd_retry() {
       return 0
     fi
 
-    echo_warn "$context 第${try}/${max_try}次失败(rc=$rc, shell=$shell_path): $(printf '%s' "$output" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "$context 第${try}/${max_try}次失败(rc=$rc, shell=$shell_path): $(printf '%s' "$output" | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
     [ "$diag_on_fail" = "1" ] && [ "$try" -eq "$max_try" ] && dump_chroot_exec_diagnostics "${context}#${try}" "$rc" "$output" "$shell_path"
 
     [ "$try" -lt "$max_try" ] && sleep "$sleep_s"
@@ -1769,12 +1824,14 @@ prepare_and_start_sshd() {
   fi
 
   run_chroot_cmd_retry "chroot入口预热" 'true' 5 2 1 || {
-    echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   }
 
   run_chroot_cmd_retry "sshd配置预检" "mkdir -p /run/sshd && chmod 755 /run/sshd && if command -v ssh-keygen >/dev/null 2>&1; then ssh-keygen -A >/dev/null 2>&1 || true; fi && $sshd_bin -t" 5 1 1
   if [ $? -ne 0 ]; then
-    echo_warn "sshd配置预检有告警: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "sshd配置预检有告警: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   fi
 
   if ! chroot_pid_alive_retry; then
@@ -1788,12 +1845,14 @@ prepare_and_start_sshd() {
 
   if chroot_pid_alive_retry; then
     run_chroot_cmd_retry "读取sshd pid" 'cat /run/sshd.pid 2>/dev/null' 3 1 0 >/dev/null 2>&1 || true
-    ROOTFS_SSHD_PID=$(printf '%s' "$CHROOT_LAST_OUTPUT" | tr -d '\n')
+    ROOTFS_SSHD_PID=$(printf '%s' "$CHROOT_LAST_OUTPUT" | tr -d '
+')
     SSHD_RUNNING=1
     echo_info "SSH自检: 已准备 /run/sshd，sshd运行中 (Port: $port)"
   else
     SSHD_RUNNING=0
-    echo_warn "SSH自检: 已尝试启动 sshd，但未确认存活 (Port: $port)，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+    echo_warn "SSH自检: 已尝试启动 sshd，但未确认存活 (Port: $port)，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
+' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   fi
 }
 
@@ -1906,6 +1965,18 @@ kill_pid_tree() {
   done
 }
 
+quick_lazy_umount() {
+  local mp="$1"
+  case "$mp" in
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+      umount -l "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true
+      ;;
+    *)
+      umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+      ;;
+  esac
+}
+
 cleanup() {
   [ "$CLEANUP_DONE" -eq 1 ] && return 0
   IN_CLEANUP=1
@@ -1944,7 +2015,7 @@ cleanup() {
   for ((i=${#MOUNT_STACK[@]}-1; i>=0; i--)); do
     mnt="${MOUNT_STACK[$i]}"
     if is_mounted "$mnt"; then
-      umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
+      quick_lazy_umount "$mnt"
     fi
   done
 
@@ -1952,9 +2023,10 @@ cleanup() {
 
   if [ "$IMAGE_MODE" -eq 1 ]; then
     if is_mounted "$TARGET"; then
-      umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null || true
+      quick_lazy_umount "$TARGET"
     fi
     [ -n "$IMAGE_LOOPDEV" ] && /data/data/com.termux/files/usr/bin/losetup -d "$IMAGE_LOOPDEV" 2>/dev/null || true
+    cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
   fi
 
   local residual
@@ -1962,6 +2034,7 @@ cleanup() {
   if [ "$residual" -gt 0 ]; then
     echo_warn "检测到残留挂载: $residual"
     grep -F " $TARGET" /proc/self/mountinfo | tee -a "$LOG_FILE"
+    log_mountpoint_evidence "cleanup_residual" "$TARGET"
   else
     echo_info "✅ 挂载已清理"
   fi
@@ -1980,21 +2053,22 @@ if [ -z "${_ISOLATED_NAMESPACE:-}" ]; then
   cleanup_current_namespace_stale_image_mount
   export _ISOLATED_NAMESPACE=1
   if unshare --help 2>&1 | grep -q -- "--propagation"; then
-    exec unshare --mount --propagation private env _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
+    exec unshare --mount --propagation private env LOG_FILE="$LOG_FILE" _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
   fi
-  exec unshare -m env _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
+  exec unshare -m env LOG_FILE="$LOG_FILE" _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
 fi
-
 trap cleanup EXIT SIGINT SIGTERM SIGHUP QUIT
 
 check_cmds
 [ "$(id -u)" -ne 0 ] && echo_err "必须使用root权限执行（KernelSU/su）"
+check_selinux
 mount_rootfs_image_if_exists
 if [ "$IMAGE_MODE" -eq 1 ]; then
   MOUNT_STACK+=("$TARGET")
   echo_info "已挂载镜像 rootfs: $IMAGE_FILE -> $TARGET"
 fi
 [ ! -d "$TARGET" ] && echo_err "rootfs目录不存在: $TARGET（可用 --rootfs 指定自定义rootfs路径）"
+
 
 nested_target_mounts=0
 if grep -Fq " $TARGET/proc " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/dev " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/system " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/android_root " /proc/self/mountinfo 2>/dev/null; then
@@ -2010,7 +2084,6 @@ if [ -f "$TARGET$CHROOT_MARKER" ] || [ "$nested_target_mounts" -eq 1 ]; then
   echo_err "检测到疑似嵌套chroot，已拒绝执行"
 fi
 
-check_selinux
 preflight_chroot
 if [ "$USE_PROOT_FALLBACK" -eq 1 ]; then
   run_proot_fallback
