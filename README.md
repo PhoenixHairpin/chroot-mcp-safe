@@ -84,6 +84,23 @@ do_mount "$REAL_APEX" "$TARGET/apex" "rbind" "$SYS_MOUNT_OPT"
 
 ## 🚀 使用方法
 
+### 镜像容量（新增）
+
+```bash
+# 迁移为镜像时，默认创建 20GB（未指定时）
+./chroot-mcp-safe.sh --migrate-image --distro ubuntu --rootfs /data/local/chroot/ubuntu
+
+# 指定镜像目标容量（单位 GB）
+./chroot-mcp-safe.sh --migrate-image --image-size-gb 40 --distro ubuntu --rootfs /data/local/chroot/ubuntu
+```
+
+交互模式选择“下载rootfs后启动”时，也会询问镜像大小（留空默认 20GB）。
+
+行为说明：
+- 仅在“新建镜像”时使用该容量参数
+- 如果填写值小于最小所需空间，会自动上调到可用最小值
+- 已存在的镜像文件不会因为该参数被自动缩容或改写
+
 ### 启动容器
 ```bash
 # 后台启动 Ubuntu
@@ -166,7 +183,7 @@ runuser -u myuser -- python3 /tmp/some_script.py
 ## 📂 文件位置
 
 - **脚本**: `/data/user/0/com.termux/files/home/chroot-mcp-safe.sh`
-- **镜像**: `/data/local/chroot-images/ubuntu.img` (约 918MB)
+- **镜像**: `/data/local/chroot-images/ubuntu.img` (容量按创建参数，例如默认 20GB)
 - **挂载点**: `/mnt/chroot-rootfs/ubuntu`
 - **状态文件**: `/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-ubuntu.info`
 - **日志**: `/data/data/com.termux/files/usr/tmp/chroot-mcp-*.log`
