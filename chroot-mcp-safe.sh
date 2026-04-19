@@ -84,6 +84,7 @@ MIGRATE_MODE=0
 AUTO_MIGRATE=0
 MIGRATE_IMAGE_MODE=0
 AUTO_MIGRATE_IMAGE=0
+RESIZE_IMAGE_MODE=0
 IMAGE_MODE=0
 IMAGE_FILE=""
 IMAGE_MOUNTPOINT=""
@@ -181,6 +182,10 @@ while [ $# -gt 0 ]; do
       MIGRATE_IMAGE_MODE=1
       shift
       ;;
+    --resize-image)
+      RESIZE_IMAGE_MODE=1
+      shift
+      ;;
     --auto-migrate-image)
       AUTO_MIGRATE_IMAGE=1
       shift
@@ -192,7 +197,7 @@ while [ $# -gt 0 ]; do
       ;;
     --help|-h)
       cat <<USAGE
-用法: $0 [--interactive] [--daemon] [--status] [--stop] [--migrate] [--auto-migrate] [--migrate-image] [--auto-migrate-image] [--image-size-gb <GB>] [--safe|--full-access] [--permissive] [--ro-data] [--distro <名称>] [--rootfs <目录>] [--proot-fallback] [--print-install]
+用法: $0 [--interactive] [--daemon] [--status] [--stop] [--migrate] [--auto-migrate] [--migrate-image] [--resize-image] [--auto-migrate-image] [--image-size-gb <GB>] [--safe|--full-access] [--permissive] [--ro-data] [--distro <名称>] [--rootfs <目录>] [--proot-fallback] [--print-install]
   --interactive     交互式向导（选择发行版/下载rootfs/启动参数）
   --daemon          后台模式：挂载并启动 chroot 内 sshd 后立即返回，不进入交互shell
   --status          查看后台模式状态（不新建挂载）
@@ -200,6 +205,7 @@ while [ $# -gt 0 ]; do
   --migrate         将当前 rootfs 迁移到 /data/local/chroot/<distro> 并修正权限/属主
   --auto-migrate    启动前若发现 rootfs 位于 /data/..termux.. 内，则自动迁移到 /data/local/chroot/<distro>
   --migrate-image   将当前 rootfs 迁移为 ext4 镜像，并在运行时挂载到 /mnt/chroot-rootfs/<distro>
+  --resize-image    对现有 ext4 镜像执行安全扩容：停止运行实例、e2fsck、resize2fs，并保持结果持久化
   --auto-migrate-image  启动前若 rootfs 位于 /data 子树内且镜像不存在，则自动迁移为 ext4 镜像，以实现 /data 真1:1 映射
   --image-size-gb <GB>  设置镜像目标大小(GB)；未指定默认20GB，且不足时会自动提升到最小所需大小
   --safe            安全模式：/data 与 /storage/emulated/0 只读；系统分区保持只读
@@ -250,12 +256,31 @@ read_daemon_info() {
   return 0
 }
 
+pid_root_matches_target() {
+  local pid="$1"
+  local target="$2"
+  local root=""
+
+  [ -n "$pid" ] || return 1
+  [ -n "$target" ] || return 1
+  [ -d "/proc/$pid" ] || return 1
+
+  root=$(readlink "/proc/$pid/root" 2>/dev/null || true)
+  case "$root" in
+    "$target"|"$target"/*)
+      return 0
+      ;;
+  esac
+
+  return 1
+}
+
 # 扫描所有发行版并显示运行状态概览
 
 # 扫描所有发行版并显示运行状态概览
 show_all_containers_status() {
   local distros="ubuntu debian arch fedora alpine"
-  local name file alive port pid target started
+  local name file alive port pid target started rootfs_target runtime_pids state_label
   local running_count=0
 
   echo ""
@@ -270,23 +295,40 @@ show_all_containers_status() {
     pid="-"
     target="-"
     started="-"
+    state_label="未运行"
+    rootfs_target="$(find_existing_rootfs "$name")"
+    runtime_pids=""
 
     if [ -f "$file" ]; then
       DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
       if read_daemon_info "$file" 2>/dev/null; then
         pid="${DAEMON_SSHD_PID:-}"
         port="${DAEMON_PORT:-}"
-        target="${DAEMON_TARGET:-}"
+        target="${DAEMON_TARGET:-$rootfs_target}"
         started="${DAEMON_STARTED_AT:-}"
-        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+        if pid_root_matches_target "$pid" "$target"; then
           alive="yes"
+          state_label="后台"
           running_count=$((running_count + 1))
         fi
       fi
     fi
 
+    if [ "$alive" = "no" ] && [ -n "$rootfs_target" ]; then
+      runtime_pids="$(collect_pids_by_root_prefix "$rootfs_target")"
+      if [ -n "$runtime_pids" ]; then
+        pid="$(first_pid_from_list "$runtime_pids")"
+        target="$rootfs_target"
+        port="-"
+        started="-"
+        alive="yes"
+        state_label="前台/残留"
+        running_count=$((running_count + 1))
+      fi
+    fi
+
     if [ "$alive" = "yes" ]; then
-      printf "║  🟢 %-8s 运行中  PID=%-6s Port=%-5s %-20s ║\n" "$name" "$pid" "$port" "$started"
+      printf "║  🟢 %-8s %-9s PID=%-6s Port=%-5s %-18s ║\n" "$name" "$state_label" "$pid" "$port" "$started"
     else
       printf "║  ⚪ %-8s 未运行                                              ║\n" "$name"
     fi
@@ -311,7 +353,7 @@ daemon_status() {
   fi
 
   local alive="no"
-  if [ -n "${DAEMON_SSHD_PID:-}" ] && [ -d "/proc/${DAEMON_SSHD_PID}" ]; then
+  if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$TARGET}"; then
     alive="yes"
   fi
 
@@ -489,7 +531,11 @@ daemon_stop() {
 
   [ -n "${DAEMON_TARGET:-}" ] || { echo "[stop] 状态文件缺少 TARGET"; return 1; }
   [ -n "${DAEMON_SSHD_PID:-}" ] || { echo "[stop] 状态文件缺少 SSHD_PID"; return 1; }
-  [ -d "/proc/${DAEMON_SSHD_PID}" ] || { echo "[stop] sshd pid 不存在: ${DAEMON_SSHD_PID}"; rm -f "$file"; return 1; }
+  if ! pid_root_matches_target "${DAEMON_SSHD_PID}" "${DAEMON_TARGET}"; then
+    echo "[stop] 状态文件中的 sshd pid 与目标 rootfs 不匹配或已失效: ${DAEMON_SSHD_PID}"
+    rm -f "$file"
+    return 1
+  fi
 
   echo "[stop] 进入 mount namespace 清理: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET}"
   nsenter -t "$DAEMON_SSHD_PID" -m -- /data/data/com.termux/files/usr/bin/bash -s -- "$DAEMON_TARGET" "$DAEMON_SSHD_PID" "${DAEMON_IMAGE_LOOPDEV:-}" <<'EOS'
@@ -772,6 +818,170 @@ resolve_image_size_mib() {
   echo "$requested_mib"
 }
 
+resolve_image_resize_target_mib() {
+  local requested_gb="$1"
+  local current_bytes="$2"
+  local current_mib
+
+  if [ -z "$requested_gb" ]; then
+    echo "[resize-image] 未提供目标大小" >&2
+    return 1
+  fi
+
+  if ! [[ "$requested_gb" =~ ^[0-9]+$ ]] || [ "$requested_gb" -le 0 ]; then
+    echo "[resize-image] 非法镜像大小: ${requested_gb} GB（必须是正整数）" >&2
+    return 1
+  fi
+
+  current_mib=$(( (current_bytes + 1048575) / 1048576 ))
+  if [ $(( requested_gb * 1024 )) -lt "$current_mib" ]; then
+    echo_warn "[resize-image] 目标大小 ${requested_gb} GB 小于当前镜像大小 $(( (current_mib + 1023) / 1024 )) GB，已自动保持当前大小"
+    echo "$current_mib"
+    return 0
+  fi
+
+  echo $(( requested_gb * 1024 ))
+}
+
+ensure_loop_device_node() {
+  local loopdev="$1"
+  local sysdev major minor node_created=0
+
+  [ -n "$loopdev" ] || return 1
+  [ -b "$loopdev" ] && return 0
+
+  sysdev="/sys/class/block/${loopdev##*/}/dev"
+  [ -f "$sysdev" ] || return 1
+
+  major=$(cut -d: -f1 "$sysdev" 2>/dev/null || true)
+  minor=$(cut -d: -f2 "$sysdev" 2>/dev/null || true)
+  [ -n "$major" ] && [ -n "$minor" ] || return 1
+
+  if mknod "$loopdev" b "$major" "$minor" 2>/dev/null; then
+    node_created=1
+  fi
+
+  [ "$node_created" -eq 1 ] || [ -b "$loopdev" ]
+}
+
+get_image_loopdev_for_file() {
+  local image_file="$1"
+  local loopdev=""
+
+  loopdev=$(list_loop_devices_for_image "$image_file" | awk 'NF{print $1; exit}')
+  [ -n "$loopdev" ] && {
+    echo "$loopdev"
+    return 0
+  }
+
+  loopdev=$(losetup -a 2>/dev/null | awk -v img="$image_file" '$0 ~ img {sub(/:.*/, "", $1); print $1; exit}')
+  [ -n "$loopdev" ] && {
+    echo "$loopdev"
+    return 0
+  }
+
+  return 1
+}
+
+loopdev_has_active_mounts() {
+  local loopdev="$1"
+  local p
+
+  [ -n "$loopdev" ] || return 1
+  for p in /proc/[0-9]*/mountinfo; do
+    [ -r "$p" ] || continue
+    if grep -Fq " $loopdev " "$p"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resize_rootfs_image() {
+  local image_file="$IMAGE_FILE"
+  local loopdev=""
+  local target_mib current_bytes target_bytes daemon_file daemon_alive=0 need_detach=0 stop_confirm="" fsck_rc=0
+
+  [ -f "$image_file" ] || { echo "[resize-image] 镜像不存在: $image_file"; return 1; }
+  [ -n "$IMAGE_SIZE_GB" ] || { echo "[resize-image] 请使用 --image-size-gb 指定目标大小"; return 1; }
+
+  daemon_file="$(get_daemon_info_file)"
+  if read_daemon_info "$daemon_file" 2>/dev/null; then
+    if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$TARGET}"; then
+      daemon_alive=1
+      echo_warn "检测到容器正在运行: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET:-$TARGET}"
+      if has_interactive_tty; then
+        stop_confirm=$(choose_option "扩容前需要安全停止运行中的容器，是否继续?" "继续并安全停止" "取消")
+        [ "$stop_confirm" = "继续并安全停止" ] || { echo "[resize-image] 已取消"; return 1; }
+      else
+        echo "[resize-image] 容器仍在运行，请先执行 --stop 后重试"
+        return 1
+      fi
+      daemon_stop || { echo "[resize-image] 停止运行中的容器失败"; return 1; }
+    fi
+  fi
+
+  cleanup_current_namespace_stale_image_mount
+  loopdev="$(get_image_loopdev_for_file "$image_file" || true)"
+  if [ -n "$loopdev" ]; then
+    if ensure_loop_device_node "$loopdev"; then
+      if loopdev_has_active_mounts "$loopdev"; then
+        echo "[resize-image] 镜像仍处于挂载状态，请先退出相关容器后重试: $loopdev"
+        return 1
+      fi
+      losetup -d "$loopdev" 2>/dev/null || {
+        echo "[resize-image] 无法释放残留 loop 设备: $loopdev"
+        return 1
+      }
+    else
+      echo_warn "检测到残留 loop 设备但无法补建设备节点，继续尝试直接附加镜像"
+    fi
+  fi
+
+  current_bytes=$(stat -c '%s' "$image_file" 2>/dev/null || echo 0)
+  target_mib=$(resolve_image_resize_target_mib "$IMAGE_SIZE_GB" "$current_bytes") || return 1
+  target_bytes=$(( target_mib * 1048576 ))
+
+  if [ "$target_bytes" -eq "$current_bytes" ]; then
+    echo_info "[resize-image] 镜像文件已达到目标大小，无需扩展文件，仅执行文件系统检查/扩容"
+  else
+    echo_info "[resize-image] 扩展镜像文件到 $(( target_mib / 1024 )) GB"
+    truncate -s "${target_mib}M" "$image_file" || { echo "[resize-image] truncate 失败"; return 1; }
+  fi
+
+  loopdev=$(/data/data/com.termux/files/usr/bin/losetup -f --show "$image_file" 2>/dev/null) || { echo "[resize-image] loop 绑定失败"; return 1; }
+  need_detach=1
+  echo_info "[resize-image] 已绑定 loop: $loopdev"
+
+  e2fsck -fy "$loopdev"
+  fsck_rc=$?
+  if [ "$fsck_rc" -gt 3 ]; then
+    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    echo "[resize-image] e2fsck 失败(exit=$fsck_rc)，请检查镜像状态"
+    return 1
+  fi
+
+  resize2fs "$loopdev" || {
+    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    echo "[resize-image] resize2fs 失败"
+    return 1
+  }
+
+  dumpe2fs -h "$loopdev" 2>/dev/null | grep -E 'Block count|Free blocks|Block size|Filesystem state' || true
+
+  if [ "$need_detach" -eq 1 ]; then
+    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || {
+      echo_warn "[resize-image] loop 设备释放失败，请手动检查: $loopdev"
+      return 1
+    }
+  fi
+
+  sync
+  echo_info "[resize-image] 扩容完成: $image_file"
+  return 0
+}
+
 mount_rootfs_image_if_exists() {
   set_image_paths
   [ -f "$IMAGE_FILE" ] || return 0
@@ -989,7 +1199,7 @@ check_residual_state() {
 
   file="$(get_daemon_info_file)"
   if read_daemon_info "$file"; then
-    if [ -n "${DAEMON_SSHD_PID:-}" ] && [ -d "/proc/${DAEMON_SSHD_PID}" ]; then
+    if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$TARGET}"; then
       daemon_alive=1
       daemon_pid="${DAEMON_SSHD_PID}"
       daemon_target="${DAEMON_TARGET:-$TARGET}"
@@ -1114,7 +1324,8 @@ choose_option() {
       echo "  [$i] $opt" >&2
       i=$((i+1))
     done
-    read -r -p "请输入编号: " idx
+    printf '请输入编号: ' >&2
+    IFS= read -r idx
     if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#options[@]}" ]; then
       selected="${options[$((idx-1))]}"
     else
@@ -1131,7 +1342,8 @@ ask_text() {
     val=$(termux-dialog text -t "$prompt" 2>/dev/null | dialog_extract_text | head -n1)
   fi
   if [ -z "$val" ]; then
-    read -r -p "$prompt: " val
+    printf '%s: ' "$prompt" >&2
+    IFS= read -r val
   fi
   echo "$val"
 }
@@ -1260,29 +1472,62 @@ EOF
 }
 
 interactive_wizard() {
-  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm image_size_input
-  
+  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm image_size_input resize_confirm enter_distro enter_file enter_rootfs enter_pids enter_pid enter_target
+
   # 显示容器运行状态概览
   show_all_containers_status
-  
-  action=$(choose_option "选择操作" "启动已存在rootfs" "下载rootfs后启动" "安全终止卸载容器" "只打印安装建议")
-  
+
+  action=$(choose_option "选择操作" "直接进入已启动容器" "启动已存在rootfs" "下载rootfs后启动" "安全终止卸载容器" "安全扩容镜像" "只打印安装建议")
+
+  if [ "$action" = "直接进入已启动容器" ]; then
+    enter_distro=$(choose_option "选择要进入的发行版" ubuntu debian arch fedora alpine)
+    DISTRO_NAME="$enter_distro"
+    apply_distro_preset
+    enter_file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${enter_distro}.info"
+    enter_rootfs="$(find_existing_rootfs "$enter_distro")"
+    enter_pid=""
+    enter_target=""
+
+    if [ -f "$enter_file" ]; then
+      DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+      if read_daemon_info "$enter_file" && pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$enter_rootfs}"; then
+        enter_pid="${DAEMON_SSHD_PID}"
+        enter_target="${DAEMON_TARGET:-$enter_rootfs}"
+      else
+        rm -f "$enter_file" 2>/dev/null || true
+      fi
+    fi
+
+    if [ -z "$enter_pid" ] && [ -n "$enter_rootfs" ]; then
+      enter_pids="$(collect_pids_by_root_prefix "$enter_rootfs")"
+      if [ -n "$enter_pids" ]; then
+        enter_pid="$(first_pid_from_list "$enter_pids")"
+        enter_target="$enter_rootfs"
+      fi
+    fi
+
+    [ -n "$enter_pid" ] || { echo "错误: 未检测到 ${enter_distro} 的已运行容器" >&2; exit 2; }
+    [ -n "$enter_target" ] || enter_target="$enter_rootfs"
+    enter_existing_container "$enter_pid" "$enter_target"
+    exit $?
+  fi
+
   # 处理"安全终止卸载容器"选项
   if [ "$action" = "安全终止卸载容器" ]; then
     stop_distro=$(choose_option "选择要终止的发行版" ubuntu debian arch fedora alpine)
     DISTRO_NAME="$stop_distro"
-    
+
     # 检查该发行版是否正在运行
     local stop_file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${stop_distro}.info"
     if [ ! -f "$stop_file" ]; then
       echo "该发行版未运行（无状态文件）" >&2
       exit 0
     fi
-    
+
     # 清空之前读取的变量
     DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
     if read_daemon_info "$stop_file"; then
-      if [ -n "${DAEMON_SSHD_PID:-}" ] && [ -d "/proc/${DAEMON_SSHD_PID}" ]; then
+      if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$(find_existing_rootfs "$stop_distro")}"; then
         echo "" >&2
         echo "发行版: $stop_distro" >&2
         echo "PID: ${DAEMON_SSHD_PID}" >&2
@@ -1290,7 +1535,7 @@ interactive_wizard() {
         echo "Target: ${DAEMON_TARGET:-unknown}" >&2
         echo "启动时间: ${DAEMON_STARTED_AT:-unknown}" >&2
         echo "" >&2
-        
+
         stop_confirm=$(choose_option "确认终止并卸载?" "确认终止" "取消操作")
         if [ "$stop_confirm" = "确认终止" ]; then
           echo "[stop] 正在终止 ${stop_distro} 容器..." >&2
@@ -1310,7 +1555,32 @@ interactive_wizard() {
     fi
     exit 0
   fi
-  
+
+  if [ "$action" = "安全扩容镜像" ]; then
+    distro=$(choose_option "选择要扩容的发行版" ubuntu debian arch fedora alpine)
+    DISTRO_NAME="$distro"
+    apply_distro_preset
+    set_image_paths
+    [ -f "$IMAGE_FILE" ] || { echo "错误: 未找到 ${distro} 的镜像文件: $IMAGE_FILE" >&2; exit 2; }
+
+    image_size_input=$(ask_text "输入目标镜像大小GB(例如 50)")
+    if [ -z "$image_size_input" ]; then
+      echo "错误: 未提供目标大小" >&2
+      exit 2
+    fi
+    if ! [[ "$image_size_input" =~ ^[0-9]+$ ]] || [ "$image_size_input" -le 0 ]; then
+      echo "错误: 镜像大小必须是正整数GB" >&2
+      exit 2
+    fi
+    IMAGE_SIZE_GB="$image_size_input"
+
+    resize_confirm=$(choose_option "将安全停止容器、执行 e2fsck 和 resize2fs，并使扩容在重启后保持。继续?" "确认扩容" "取消操作")
+    [ "$resize_confirm" = "确认扩容" ] || { echo "已取消扩容操作" >&2; exit 0; }
+
+    RESIZE_IMAGE_MODE=1
+    return 0
+  fi
+
   distro=$(choose_option "选择发行版" ubuntu debian arch fedora alpine)
   DISTRO_NAME="$distro"
   apply_distro_preset
@@ -1394,6 +1664,7 @@ if [ "$INTERACTIVE_MODE" -eq 1 ]; then
     [ -n "${DISTRO_NAME:-}" ] && ORIG_ARGS+=(--distro "$DISTRO_NAME")
     [ -n "${TARGET:-}" ] && ORIG_ARGS+=(--rootfs "$TARGET")
     [ -n "${IMAGE_SIZE_GB:-}" ] && ORIG_ARGS+=(--image-size-gb "$IMAGE_SIZE_GB")
+    [ "$RESIZE_IMAGE_MODE" -eq 1 ] && ORIG_ARGS+=(--resize-image)
     [ "$AUTO_MIGRATE_IMAGE" -eq 1 ] && ORIG_ARGS+=(--auto-migrate-image)
     [ "$PERMISSIVE" -eq 1 ] && ORIG_ARGS+=(--permissive)
     [ "$RO_DATA" -eq 1 ] && ORIG_ARGS+=(--ro-data)
@@ -1425,6 +1696,12 @@ fi
 
 if [ "$MIGRATE_IMAGE_MODE" -eq 1 ]; then
   migrate_rootfs_to_image
+  exit $?
+fi
+
+if [ "$RESIZE_IMAGE_MODE" -eq 1 ]; then
+  set_image_paths
+  resize_rootfs_image
   exit $?
 fi
 
@@ -1636,6 +1913,29 @@ Port %s
   fi
 }
 
+ensure_rootfs_sshd_access() {
+  local cfg="$TARGET/etc/ssh/sshd_config"
+  local tmp=""
+
+  [ -f "$cfg" ] || return 0
+  cp -an "$cfg" "${cfg}.mcp.bak" 2>/dev/null || true
+
+  tmp=$(mktemp "/data/data/com.termux/files/usr/tmp/sshd_config.XXXXXX") || return 1
+  {
+    printf '%s\n' '# BEGIN chroot-mcp-safe sshd'
+    printf '%s\n' 'PermitRootLogin yes'
+    printf '%s\n' 'PasswordAuthentication yes'
+    printf '%s\n' 'KbdInteractiveAuthentication yes'
+    printf '%s\n' 'Subsystem sftp internal-sftp'
+    printf '%s\n\n' '# END chroot-mcp-safe sshd'
+    sed '/^# BEGIN chroot-mcp-safe sshd$/,/^# END chroot-mcp-safe sshd$/d' "$cfg"
+  } > "$tmp"
+
+  cat "$tmp" > "$cfg"
+  rm -f "$tmp" 2>/dev/null || true
+  echo_info '已规范 rootfs sshd 登录/SFTP 配置'
+}
+
 get_rootfs_sshd_port() {
   local cfg="$TARGET/etc/ssh/sshd_config"
   if [ -f "$cfg" ]; then
@@ -1807,6 +2107,7 @@ prepare_and_start_sshd() {
   SSHD_PRESENT=1
 
   ensure_rootfs_sshd_port
+  ensure_rootfs_sshd_access
 
   mkdir -p "$TARGET/run/sshd" 2>/dev/null || true
   chmod 755 "$TARGET/run/sshd" 2>/dev/null || true
