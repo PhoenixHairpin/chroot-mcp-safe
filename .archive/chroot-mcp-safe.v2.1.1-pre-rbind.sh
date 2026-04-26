@@ -1041,11 +1041,6 @@ for p in $(collect_target_pids); do kill -9 "$p" 2>/dev/null || true; done
 sync 2>/dev/null
 for m in \
   "$TARGET/etc/resolv.conf" \
-  "$TARGET/sys/kernel/tracing" \
-  "$TARGET/sys/kernel/debug" \
-  "$TARGET/mi_ext" \
-  "$TARGET/mnt" \
-  "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
@@ -1074,7 +1069,7 @@ for m in \
   "$TARGET/proc"
   do
   case "$m" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
       umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
       ;;
     *)
@@ -1203,11 +1198,6 @@ for p in $(collect_target_pids); do kill -9 "$p" 2>/dev/null || true; done
 sync 2>/dev/null
 for m in \
   "$TARGET/etc/resolv.conf" \
-  "$TARGET/sys/kernel/tracing" \
-  "$TARGET/sys/kernel/debug" \
-  "$TARGET/mi_ext" \
-  "$TARGET/mnt" \
-  "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
@@ -1236,7 +1226,7 @@ for m in \
   "$TARGET/proc"
   do
   case "$m" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
       umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
       ;;
     *)
@@ -3522,10 +3512,6 @@ do_mount() {
   elif [ "$type" = "rbind" ]; then
     mount --rbind "$src" "$dst" || echo_err "rbind挂载失败: $src -> $dst"
 
-    # rbind 关键安全步：把整棵子树设为 rprivate，断开与宿主的传播
-    # 这样容器内对子挂载点的任何后续操作都不会反向影响宿主分区
-    mount --make-rprivate "$dst" 2>/dev/null || mount --make-private "$dst" 2>/dev/null || true
-
     if [ -n "$opt" ]; then
       mount -o "remount,bind,$opt" "$dst" || {
         echo_warn "remount失败，回退只读: $dst"
@@ -3572,7 +3558,7 @@ kill_pid_tree() {
 quick_lazy_umount() {
   local mp="$1"
   case "$mp" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
       umount -l "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true
       ;;
     *)
@@ -3702,22 +3688,16 @@ echo_info "已锁定根目录传播属性为private"
 echo_info "开始构建MCP专属Chroot环境..."
 
 do_mount "proc" "$TARGET/proc" "proc" "nosuid,noexec,nodev"
-# sysfs 改 rw 是为了让容器内能 mkdir 子挂载点（debugfs/tracefs）
-# sysfs 节点本身的写权限受内核保护，rw 挂载并不会让 agent 能改内核状态
-do_mount "sysfs" "$TARGET/sys" "sysfs" "nosuid,noexec,nodev"
+do_mount "sysfs" "$TARGET/sys" "sysfs" "nosuid,noexec,nodev,ro"
 
-# /dev 用 rbind 一并拿到 /dev/binderfs, /dev/pts 等子挂载，避免单独挂载叠加
-# 注意: nosuid 保留(防 setuid 攻击)，noexec 必须去掉，否则 /dev/ashmem 等设备
-# 工具(stackplz/frida 注入)无法运行
-do_mount "/dev" "$TARGET/dev" "rbind" "nosuid"
+do_mount "/dev" "$TARGET/dev" "bind" "nosuid,noexec"
 mkdir -p "$TARGET/dev/pts"
 chmod 1777 "$TARGET/dev/shm" 2>/dev/null || true
-# 容器自己的 devpts 实例(newinstance + ptmxmode)，避免与宿主 pts 冲突
 do_mount "devpts" "$TARGET/dev/pts" "devpts" "nosuid,noexec,newinstance,ptmxmode=0666"
 
-# binderfs 已通过 rbind 自动进来，此处仅兜底兼容旧路径(若 rbind 漏挂)
-if [ -d "/dev/binderfs" ] && ! grep -Fq " $TARGET/dev/binderfs " /proc/self/mountinfo 2>/dev/null; then
-  mkdir -p "$TARGET/dev/binderfs" 2>/dev/null || true
+# 添加 binderfs 以支持 Binder IPC（am/pm/settings 等 Android 命令需要）
+if [ -d "/dev/binderfs" ]; then
+  mkdir -p "$TARGET/dev/binderfs"
   do_mount "/dev/binderfs" "$TARGET/dev/binderfs" "bind" "rw"
 fi
 
@@ -3787,11 +3767,7 @@ prepare_data_mapping() {
     fi
   fi
 
-  # 关键改动: bind -> rbind，让宿主 /data 下的子挂载（如 /data/user/0
-  # 这种 Android 多用户 bind mount，以及未来任何其它 sub-mount）一并
-  # 进入容器。配合 do_mount 中的 make-rprivate，子挂载与宿主隔离传播，
-  # 容器异常退出时 namespace 自动 GC，不会污染宿主分区。
-  do_mount "/data" "$TARGET/data" "rbind" "$DATA_MOUNT_OPT"
+  do_mount "/data" "$TARGET/data" "bind" "$DATA_MOUNT_OPT"
 }
 
 normalize_direct_android_mountpoints
@@ -3820,70 +3796,8 @@ if [ -d "/linkerconfig" ]; then
 fi
 
 if [ -d "/storage/emulated/0" ]; then
-  # rbind 拿到 Android/data, Android/obb 等子挂载（Android 11+ 多挂载点视图）
-  do_mount "/storage/emulated/0" "$TARGET/storage/emulated/0" "rbind" "$SDCARD_MOUNT_OPT"
-  do_mount "/storage/emulated/0" "$TARGET/sdcard" "rbind" "$SDCARD_MOUNT_OPT"
-fi
-
-# ==============================================
-# 多挂载点 Agent 增强区（v2.2 新增）
-# 目的: 让容器内 agent 能看到完整 Android 视图，支持调试/逆向
-# 安全: 全部 rbind/bind 在 namespace 内，已 make-rprivate 隔离传播
-# ==============================================
-
-# /data_mirror: Android 11+ 多用户镜像视图（FBE 加密分层）
-# 包含 data_ce/data_de/misc_ce/misc_de/storage_area 等子挂载
-if [ -d "/data_mirror" ]; then
-  do_mount "/data_mirror" "$TARGET/data_mirror" "rbind" "$DATA_MOUNT_OPT"
-fi
-
-# /mnt: 多用户存储视图根目录
-# 包含 /mnt/user/0, /mnt/pass_through/0, /mnt/installer/0, /mnt/androidwritable/0
-if [ -d "/mnt" ]; then
-  do_mount "/mnt" "$TARGET/mnt" "rbind" "$DATA_MOUNT_OPT"
-
-  # 关键变砖防护：把高危子挂载强制 remount 只读
-  # /mnt/vendor/persist: IMEI/序列号/校准数据，写入即变砖
-  # /mnt/vendor/qmcs:    高通 QMCS 指纹/认证数据
-  # 由于已经 make-rprivate，容器内 remount,ro 不会传到宿主，宿主功能不受影响
-  for _danger in /mnt/vendor/persist /mnt/vendor/qmcs; do
-    if grep -qE " $TARGET$_danger " /proc/self/mountinfo 2>/dev/null; then
-      mount -o remount,bind,ro "$TARGET$_danger" 2>/dev/null \
-        && echo_info "🛡 已强制只读: $_danger（变砖防护）" \
-        || echo_warn "⚠ 无法只读 $_danger，请勿在容器内写入"
-    fi
-  done
-fi
-
-# /mi_ext: 小米厂商扩展（erofs ro，bind 进来仅供查看）
-if [ -d "/mi_ext" ]; then
-  do_mount "/mi_ext" "$TARGET/mi_ext" "bind" "ro"
-fi
-
-# /sys/kernel/debug: debugfs，BPF/kprobe/uprobe/ftrace 全靠它
-# /sys/kernel/tracing: tracefs，stackplz/perf/ftrace 直接读这个
-# mountinfo 第 5 字段才是挂载点；用 awk 精确匹配避免假阴/假阳
-_host_has_mount() {
-  awk -v p="$1" '$5==p {found=1; exit} END{exit !found}' /proc/self/mountinfo
-}
-
-if [ -d "/sys/kernel/debug" ] && _host_has_mount /sys/kernel/debug; then
-  do_mount "/sys/kernel/debug" "$TARGET/sys/kernel/debug" "bind" "rw"
-else
-  # 宿主未挂 debugfs，自己在容器内挂一份
-  if [ -d "/sys/kernel/debug" ]; then
-    mkdir -p "$TARGET/sys/kernel/debug" 2>/dev/null
-    do_mount "debugfs" "$TARGET/sys/kernel/debug" "debugfs" "rw,nosuid,nodev,noexec" || true
-  fi
-fi
-
-if [ -d "/sys/kernel/tracing" ] && _host_has_mount /sys/kernel/tracing; then
-  do_mount "/sys/kernel/tracing" "$TARGET/sys/kernel/tracing" "bind" "rw"
-else
-  if [ -d "/sys/kernel/tracing" ]; then
-    mkdir -p "$TARGET/sys/kernel/tracing" 2>/dev/null
-    do_mount "tracefs" "$TARGET/sys/kernel/tracing" "tracefs" "rw,nosuid,nodev,noexec" || true
-  fi
+  do_mount "/storage/emulated/0" "$TARGET/storage/emulated/0" "bind" "$SDCARD_MOUNT_OPT"
+  do_mount "/storage/emulated/0" "$TARGET/sdcard" "bind" "$SDCARD_MOUNT_OPT"
 fi
 
 # 修复 rootfs 内 /etc/resolv.conf：直接复制宿主 DNS 配置，不再 bind-mount。
