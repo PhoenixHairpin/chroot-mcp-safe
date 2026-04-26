@@ -1,13 +1,66 @@
-#!/data/data/com.termux/files/usr/bin/bash
+#!/system/bin/sh
+# Portable launcher: ensure bash regardless of caller (termux / tsu / su / MT 管理器)
+if [ -z "${BASH_VERSION:-}" ]; then
+  for _b in /data/data/com.termux/files/usr/bin/bash /system/bin/bash /system/xbin/bash /sbin/bash /bin/bash; do
+    [ -x "$_b" ] && exec "$_b" "$0" "$@"
+  done
+  echo "ERROR: 找不到 bash。请安装 termux (pkg install bash) 或在 /system/bin/bash 放置 bash 二进制。" >&2
+  exit 1
+fi
 
 set -u
 set -o pipefail
 
+# ==============================================
+# 运行时环境识别（兼容 termux/tsu/非termux的MT管理器/裸su）
+# ==============================================
 TERMUX_PREFIX="/data/data/com.termux/files/usr"
-export PATH="$TERMUX_PREFIX/bin:$TERMUX_PREFIX/sbin:$PATH"
-CHROOT_BIN="/system/bin/chroot"
-[ -x "$CHROOT_BIN" ] || CHROOT_BIN="$TERMUX_PREFIX/sbin/chroot"
-[ -x "$CHROOT_BIN" ] || CHROOT_BIN="$(command -v chroot 2>/dev/null || echo /system/bin/chroot)"
+HAVE_TERMUX=0
+[ -d "$TERMUX_PREFIX" ] && HAVE_TERMUX=1
+export PATH="$TERMUX_PREFIX/bin:$TERMUX_PREFIX/sbin:/system/bin:/system/xbin:/vendor/bin:/sbin:/bin:$PATH"
+
+_find_bin() {
+  local name="$1" c
+  for c in \
+    "$TERMUX_PREFIX/bin/$name" \
+    "$TERMUX_PREFIX/sbin/$name" \
+    "/system/bin/$name" \
+    "/system/xbin/$name" \
+    "/vendor/bin/$name" \
+    "/sbin/$name" \
+    "/bin/$name"; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  command -v "$name" 2>/dev/null || true
+}
+
+# 解析关键二进制；找不到时退化为裸名让 PATH 解析（不致整体崩盘）
+CHROOT_BIN="$(_find_bin chroot)";   CHROOT_BIN="${CHROOT_BIN:-/system/bin/chroot}"
+LOSETUP_BIN="$(_find_bin losetup)"; LOSETUP_BIN="${LOSETUP_BIN:-losetup}"
+NSENTER_BIN="$(_find_bin nsenter)"; NSENTER_BIN="${NSENTER_BIN:-nsenter}"
+UNSHARE_BIN="$(_find_bin unshare)"; UNSHARE_BIN="${UNSHARE_BIN:-unshare}"
+BASH_BIN="$(_find_bin bash)";       BASH_BIN="${BASH_BIN:-/system/bin/sh}"
+SH_BIN="$(_find_bin sh)";           SH_BIN="${SH_BIN:-/system/bin/sh}"
+
+# ==============================================
+# 状态目录: 优先 /data/local/tmp（始终可用），自动迁移老的 termux/tmp 状态文件
+# ==============================================
+STATE_DIR="/data/local/tmp/chroot-mcp"
+LEGACY_STATE_DIR="$TERMUX_PREFIX/tmp"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+if [ -d "$LEGACY_STATE_DIR" ]; then
+  for _legacy in "$LEGACY_STATE_DIR"/chroot-mcp-daemon-*.info; do
+    [ -f "$_legacy" ] || continue
+    _target="$STATE_DIR/$(basename "$_legacy")"
+    [ -f "$_target" ] || cp -p "$_legacy" "$_target" 2>/dev/null
+  done
+fi
+
+# 每发行版持久化配置（端口等），与 STATE_DIR 分离便于人工编辑
+PORT_CONFIG_DIR="/data/local/chroot-config"
+mkdir -p "$PORT_CONFIG_DIR" 2>/dev/null || true
+chmod 755 "$PORT_CONFIG_DIR" 2>/dev/null || true
 
 # ==============================================
 
@@ -55,7 +108,7 @@ fi
 DISTRO_NAME=""
 PRINT_INSTALL_GUIDE=0
 INTERACTIVE_MODE=0
-LOG_FILE="${LOG_FILE:-/data/data/com.termux/files/usr/tmp/chroot-mcp-$(date +%s).log}"
+LOG_FILE="${LOG_FILE:-$STATE_DIR/chroot-mcp-$(date +%s).log}"
 
 HOST_ROOT_OPT="ro"
 SYS_MOUNT_OPT="ro,nosuid"
@@ -81,6 +134,9 @@ DAEMON_INFO_FILE=""
 STATUS_MODE=0
 STOP_MODE=0
 MIGRATE_MODE=0
+EMERGENCY_SYNC_MODE=0
+REMOVE_MODE=0
+SIZE_MODE=0
 AUTO_MIGRATE=0
 MIGRATE_IMAGE_MODE=0
 AUTO_MIGRATE_IMAGE=0
@@ -91,10 +147,38 @@ IMAGE_MOUNTPOINT=""
 IMAGE_LOOPDEV=""
 IMAGE_SIZE_GB=""
 ROOTFS_EXPLICIT=0
+SSHD_PORT_EXPLICIT="${SSHD_PORT_EXPLICIT:-}"
+MCP_ROOT_PASSWORD="${MCP_ROOT_PASSWORD:-123456}"
+export MCP_ROOT_PASSWORD
 ORIG_ARGC=$#
 ORIG_ARGS=("$@")
 
 
+# ==============================================
+# 默认端口表（提前定义，wizard 也要用）
+# ==============================================
+get_rootfs_name() {
+  if [ -n "${DISTRO_NAME:-}" ]; then
+    echo "$DISTRO_NAME"
+  elif [ -n "${TARGET:-}" ]; then
+    basename "$TARGET"
+  else
+    echo ubuntu
+  fi
+}
+
+get_default_distro_sshd_port() {
+  case "$(get_rootfs_name)" in
+    ubuntu) echo "8023" ;;
+    debian) echo "8024" ;;
+    arch)   echo "8025" ;;
+    fedora) echo "8026" ;;
+    alpine) echo "8027" ;;
+    *)      echo "8023" ;;
+  esac
+}
+
+# ==============================================
 # 统一日志函数：前置流程也会调用 echo_warn/echo_info。
 # echo_err 在 cleanup 已定义后会自动触发清理；更早阶段仅记录错误并退出。
 log() {
@@ -195,27 +279,61 @@ while [ $# -gt 0 ]; do
       IMAGE_SIZE_GB="$2"
       shift 2
       ;;
+    --sshd-port)
+      [ $# -lt 2 ] && { echo "错误: --sshd-port 需要一个端口号参数 1-65535" >&2; exit 2; }
+      SSHD_PORT_EXPLICIT="$2"
+      shift 2
+      ;;
+    --root-password)
+      [ $# -lt 2 ] && { echo "错误: --root-password 需要一个密码参数" >&2; exit 2; }
+      MCP_ROOT_PASSWORD="$2"
+      export MCP_ROOT_PASSWORD
+      shift 2
+      ;;
+    --emergency-sync)
+      EMERGENCY_SYNC_MODE=1
+      shift
+      ;;
+    --remove)
+      REMOVE_MODE=1
+      shift
+      ;;
+    --size|--sizes)
+      SIZE_MODE=1
+      shift
+      ;;
     --help|-h)
       cat <<USAGE
-用法: $0 [--interactive] [--daemon] [--status] [--stop] [--migrate] [--auto-migrate] [--migrate-image] [--resize-image] [--auto-migrate-image] [--image-size-gb <GB>] [--safe|--full-access] [--permissive] [--ro-data] [--distro <名称>] [--rootfs <目录>] [--proot-fallback] [--print-install]
-  --interactive     交互式向导（选择发行版/下载rootfs/启动参数）
-  --daemon          后台模式：挂载并启动 chroot 内 sshd 后立即返回，不进入交互shell
-  --status          查看后台模式状态（不新建挂载）
-  --stop            停止后台模式并清理其挂载（不影响宿主SSH）
-  --migrate         将当前 rootfs 迁移到 /data/local/chroot/<distro> 并修正权限/属主
-  --auto-migrate    启动前若发现 rootfs 位于 /data/..termux.. 内，则自动迁移到 /data/local/chroot/<distro>
-  --migrate-image   将当前 rootfs 迁移为 ext4 镜像，并在运行时挂载到 /mnt/chroot-rootfs/<distro>
-  --resize-image    对现有 ext4 镜像执行安全扩容：停止运行实例、e2fsck、resize2fs，并保持结果持久化
-  --auto-migrate-image  启动前若 rootfs 位于 /data 子树内且镜像不存在，则自动迁移为 ext4 镜像，以实现 /data 真1:1 映射
-  --image-size-gb <GB>  设置镜像目标大小(GB)；未指定默认20GB，且不足时会自动提升到最小所需大小
-  --safe            安全模式：/data 与 /storage/emulated/0 只读；系统分区保持只读
-  --full-access     全权限模式：/data 与 /storage/emulated/0 可写（默认）
-  --permissive      临时 setenforce 0，退出自动恢复
-  --ro-data         将 /data 以只读方式挂载到 chroot
-  --distro <名称>   使用预设rootfs路径: ubuntu/debian/arch/fedora/alpine
-  --rootfs <目录>   指定要进入的Linux rootfs目录（不依赖proot-distro）
-  --proot-fallback  仅在你主动启用时，chroot失败回退到proot-distro
-  --print-install   输出对应发行版的安装/编译环境建议命令
+用法: $0 [选项]
+  --interactive,-i    交互式向导（推荐：选发行版/下载/启动）
+  --daemon            后台模式：挂载 + 启动 chroot 内 sshd 后立即返回
+  --status            查看后台模式状态
+  --stop              停止后台模式并清理挂载
+  --migrate           将当前 rootfs 迁移到 /data/local/chroot/<distro>
+  --auto-migrate      启动前若 rootfs 在 termux 沙盒内自动迁移
+  --migrate-image     将当前 rootfs 迁移为 ext4 镜像
+  --resize-image      安全扩容现有 ext4 镜像（fsck + resize2fs）
+  --auto-migrate-image  启动前若 rootfs 在 /data 子树内则自动迁移为镜像
+  --image-size-gb <GB>  镜像目标大小（默认 20GB，不足自动提升）
+  --sshd-port <PORT>  自定义 sshd 端口（被占用时自动重选空闲端口）
+  --root-password <P> 自定义 root 密码（默认 123456）
+  --emergency-sync    在所有运行中的容器与宿主全局 sync，掉电前急救
+  --remove            删除已下载的容器（rootfs/镜像，便于反复测试）
+  --size              显示所有容器的占用空间（rootfs/镜像/总和）
+  --safe              /data 与 /storage 只读
+  --full-access       /data 与 /storage 可写（默认）
+  --permissive        临时 setenforce 0
+  --ro-data           /data 只读
+  --distro <名称>     ubuntu/debian/arch/fedora/alpine
+  --rootfs <目录>     指定 rootfs 路径
+  --proot-fallback    chroot 失败时回退 proot-distro
+  --print-install     打印安装建议
+
+环境变量:
+  MCP_ROOT_PASSWORD   等价于 --root-password
+  SSHD_PORT_EXPLICIT  等价于 --sshd-port
+
+每个发行版的端口持久化在 $PORT_CONFIG_DIR/<distro>.port
 USAGE
       exit 0
       ;;
@@ -235,7 +353,7 @@ done
 get_daemon_info_file() {
   local name="${DISTRO_NAME:-}"
   [ -z "$name" ] && name="$(basename "$TARGET")"
-  echo "/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${name}.info"
+  echo "$STATE_DIR/chroot-mcp-daemon-${name}.info"
 }
 
 read_daemon_info() {
@@ -275,29 +393,310 @@ pid_root_matches_target() {
   return 1
 }
 
-# 扫描所有发行版并显示运行状态概览
+# 把字节数转成人类可读
+_human_bytes() {
+  local b="${1:-0}"
+  awk -v n="$b" 'BEGIN{
+    split("B K M G T", u);
+    i=1;
+    while(n>=1024 && i<5){ n/=1024; i++ }
+    if (i==1) printf "%d%s", n, u[i];
+    else      printf "%.1f%s", n, u[i];
+  }'
+}
+
+# 计算单个发行版占用空间
+# stdout: <bytes> <label> <path>
+# label: image|dir|none
+_distro_size_bytes() {
+  local distro="$1"
+  local image_file="/data/local/chroot-images/${distro}.img"
+  local local_rootfs="/data/local/chroot/$distro"
+  local pd_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$distro"
+  case "$distro" in arch) pd_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/archlinux" ;; esac
+
+  local bytes=0 label="none" path=""
+  if [ -f "$image_file" ]; then
+    bytes=$(stat -c '%s' "$image_file" 2>/dev/null || echo 0)
+    label="image"
+    path="$image_file"
+  elif [ -d "$local_rootfs" ]; then
+    bytes=$(du -sb --apparent-size "$local_rootfs" 2>/dev/null | awk '{print $1}')
+    [ -z "$bytes" ] && bytes=$(du -sk "$local_rootfs" 2>/dev/null | awk '{print $1*1024}')
+    label="dir"
+    path="$local_rootfs"
+  elif [ -d "$pd_rootfs" ]; then
+    bytes=$(du -sb --apparent-size "$pd_rootfs" 2>/dev/null | awk '{print $1}')
+    [ -z "$bytes" ] && bytes=$(du -sk "$pd_rootfs" 2>/dev/null | awk '{print $1*1024}')
+    label="dir"
+    path="$pd_rootfs"
+  fi
+  echo "$bytes $label $path"
+}
+
+# 计算镜像内已用/可用（仅当镜像存在）
+# stdout: <used_bytes> <total_bytes>，失败时输出 "0 0"
+_image_internal_usage() {
+  local image_file="$1"
+  local loopdev mp tmp_loop=0 base_loop
+  [ -f "$image_file" ] || { echo "0 0"; return 0; }
+
+  # losetup -j 可能返回 "/dev/loopN (lost)" 这类字段，只取第一段且去掉非路径文本
+  loopdev=$("$LOSETUP_BIN" -j "$image_file" 2>/dev/null \
+    | awk -F: 'NF>0{print $1}' \
+    | awk '{print $1}' \
+    | head -1)
+
+  if [ -z "$loopdev" ]; then
+    loopdev=$("$LOSETUP_BIN" -f --show "$image_file" 2>/dev/null) || { echo "0 0"; return 0; }
+    tmp_loop=1
+  fi
+
+  # 已挂载的话直接通过 statvfs 取大小（用 stat -f，跨 toybox/coreutils 都支持）
+  base_loop="${loopdev##*/}"   # loopN
+  mp=$(awk -v want="$base_loop" '
+    {
+      sep=0
+      for (i=1;i<=NF;i++) if ($i=="-") { sep=i; break }
+      if (sep==0) next
+      dev=$(sep+2)
+      n=split(dev, parts, "/")
+      if (parts[n]==want) { print $5; exit }
+    }
+  ' /proc/self/mountinfo 2>/dev/null)
+
+  _stat_fs_used_total() {
+    # 使用 stat -f；优先尝试 GNU 格式；不行再 toybox 兼容
+    local out blksize blocks bavail
+    # GNU coreutils: stat -f -c "%S %b %a" → fragsize blocks free-blocks
+    out=$(stat -f -c '%S %b %a' "$1" 2>/dev/null) && [ -n "$out" ] && {
+      read blksize blocks bavail <<<"$out"
+      [ -n "$blksize" ] && [ -n "$blocks" ] && [ -n "$bavail" ] && {
+        echo "$(( (blocks - bavail) * blksize )) $(( blocks * blksize ))"
+        return 0
+      }
+    }
+    # 退回 df -k（POSIX，几乎都支持）
+    out=$(df -k "$1" 2>/dev/null | awk 'NR==2{print $3, $2}')
+    [ -n "$out" ] && {
+      read u t <<<"$out"
+      [ -n "$u" ] && [ -n "$t" ] && {
+        echo "$(( u * 1024 )) $(( t * 1024 ))"
+        return 0
+      }
+    }
+    echo "0 0"
+  }
+
+  if [ -n "$mp" ]; then
+    local result
+    result=$(_stat_fs_used_total "$mp")
+    [ "$tmp_loop" -eq 1 ] && "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null
+    echo "$result"
+    return 0
+  fi
+
+  # 临时挂只读取 df
+  local tmp_mp="$STATE_DIR/sizeprobe.$$"
+  mkdir -p "$tmp_mp" 2>/dev/null
+  if mount -t ext4 -o ro "$loopdev" "$tmp_mp" 2>/dev/null; then
+    local result
+    result=$(_stat_fs_used_total "$tmp_mp")
+    umount "$tmp_mp" 2>/dev/null
+    rmdir "$tmp_mp" 2>/dev/null
+    [ "$tmp_loop" -eq 1 ] && "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null
+    echo "$result"
+    return 0
+  fi
+  rmdir "$tmp_mp" 2>/dev/null
+  [ "$tmp_loop" -eq 1 ] && "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null
+  echo "0 0"
+}
+
+# 显示所有容器占用大小（--size）
+show_all_container_sizes() {
+  local distros="ubuntu debian arch fedora alpine"
+  local total_bytes=0 d info bytes label path used inner_total
+  printf '\n  Container sizes\n'
+  printf '  %s\n' '------------------------------------------------------------------'
+  printf '  %-8s %-7s %12s %15s  %s\n' 'distro' 'kind' 'on_disk' 'in_image_used' 'path'
+  printf '  %s\n' '------------------------------------------------------------------'
+  for d in $distros; do
+    info=$(_distro_size_bytes "$d")
+    bytes=$(echo "$info" | awk '{print $1}')
+    label=$(echo "$info" | awk '{print $2}')
+    path=$(echo "$info" | cut -d' ' -f3-)
+
+    if [ "$label" = "none" ]; then
+      printf '  %-8s %-7s %12s %15s  %s\n' "$d" '-' '-' '-' '(not installed)'
+      continue
+    fi
+
+    if [ "$label" = "image" ]; then
+      read used inner_total < <(_image_internal_usage "$path")
+      printf '  %-8s %-7s %12s %15s  %s\n' \
+        "$d" "$label" "$(_human_bytes "$bytes")" \
+        "$(_human_bytes "${used:-0}") / $(_human_bytes "${inner_total:-0}")" \
+        "$path"
+    else
+      printf '  %-8s %-7s %12s %15s  %s\n' \
+        "$d" "$label" "$(_human_bytes "$bytes")" '-' "$path"
+    fi
+    total_bytes=$(( total_bytes + bytes ))
+  done
+  printf '  %s\n' '------------------------------------------------------------------'
+  printf '  %-8s %-7s %12s\n' 'TOTAL' '' "$(_human_bytes "$total_bytes")"
+  printf '  %s\n\n' '------------------------------------------------------------------'
+}
+
+# 删除已下载的容器（rootfs 目录 / ext4 镜像 / proot-distro 副本 / 持久化端口）
+# 用法: remove_distro_assets <distro> [--keep-port] [--force]
+remove_distro_assets() {
+  local distro="$1"; shift
+  local keep_port=0 force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --keep-port) keep_port=1 ;;
+      --force) force=1 ;;
+    esac
+    shift
+  done
+  [ -n "$distro" ] || { echo "[remove] 缺少发行版名" >&2; return 2; }
+
+  # 拒绝删除正在运行中的容器
+  local file="$STATE_DIR/chroot-mcp-daemon-${distro}.info"
+  local rootfs_target
+  rootfs_target="$(find_existing_rootfs "$distro")"
+  if [ -f "$file" ]; then
+    DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+    if read_daemon_info "$file" 2>/dev/null \
+       && pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$rootfs_target}"; then
+      echo "[remove] ${distro} 仍在运行（PID=${DAEMON_SSHD_PID}）。请先：$0 --stop --distro ${distro}" >&2
+      return 1
+    fi
+  fi
+
+  local image_file="/data/local/chroot-images/${distro}.img"
+  local local_rootfs="/data/local/chroot/${distro}"
+  local image_mp="/mnt/chroot-rootfs/${distro}"
+  local pd_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/${distro}"
+  case "$distro" in arch) pd_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/archlinux" ;; esac
+
+  echo "[remove] 将删除以下内容："
+  [ -f "$image_file" ]   && echo "  ext4 镜像:  $image_file ($(_human_bytes "$(stat -c %s "$image_file" 2>/dev/null || echo 0)"))"
+  [ -d "$local_rootfs" ] && echo "  目录rootfs: $local_rootfs"
+  [ -d "$pd_rootfs" ]    && echo "  proot-distro 副本: $pd_rootfs"
+  [ -f "$file" ]         && echo "  daemon 状态: $file"
+  if [ "$keep_port" -eq 0 ] && [ -f "$PORT_CONFIG_DIR/${distro}.port" ]; then
+    echo "  端口配置:   $PORT_CONFIG_DIR/${distro}.port"
+  fi
+
+  if [ "$force" -ne 1 ]; then
+    printf '确认删除? [y/N]: '
+    local ans
+    IFS= read -r ans
+    case "$ans" in y|Y|yes|YES) ;; *) echo "[remove] 已取消"; return 0 ;; esac
+  fi
+
+  # 卸载/释放任何残留挂载
+  if grep -Fq " $image_mp " /proc/self/mountinfo 2>/dev/null; then
+    umount "$image_mp" 2>/dev/null || umount -l "$image_mp" 2>/dev/null || true
+  fi
+  local lp
+  for lp in $("$LOSETUP_BIN" -j "$image_file" 2>/dev/null | awk -F: '{print $1}'); do
+    [ -n "$lp" ] && "$LOSETUP_BIN" -d "$lp" 2>/dev/null || true
+  done
+
+  rm -f "$image_file" 2>/dev/null
+  rm -rf "$local_rootfs" 2>/dev/null
+  rm -rf "$pd_rootfs" 2>/dev/null
+  rmdir "$image_mp" 2>/dev/null
+  rm -f "$file" 2>/dev/null
+  [ "$keep_port" -eq 0 ] && rm -f "$PORT_CONFIG_DIR/${distro}.port" 2>/dev/null
+
+  echo "[remove] ${distro} 已删除"
+  return 0
+}
+
+# 紧急同步：让所有运行容器内的 page cache + 宿主 cache 全部 fsync
+emergency_sync_all() {
+  echo "[emergency-sync] 触发宿主 + 全部运行容器的 sync..."
+  local file pid target distros="ubuntu debian arch fedora alpine"
+  for d in $distros; do
+    file="$STATE_DIR/chroot-mcp-daemon-${d}.info"
+    [ -f "$file" ] || continue
+    DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+    if read_daemon_info "$file" 2>/dev/null \
+       && pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-}"; then
+      pid="${DAEMON_SSHD_PID}"
+      target="${DAEMON_TARGET}"
+      echo "  [container] ${d} pid=${pid} target=${target}"
+      "$NSENTER_BIN" -t "$pid" -m -- "$SH_BIN" -c '
+        sync 2>/dev/null
+        sync 2>/dev/null
+      ' 2>/dev/null || true
+    fi
+  done
+  sync 2>/dev/null
+  sync 2>/dev/null
+  # 通知 kernel 把 dirty 页全部刷出
+  if [ -w /proc/sys/vm/drop_caches ]; then
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  fi
+  echo "[emergency-sync] 完成"
+}
 
 # 扫描所有发行版并显示运行状态概览
 show_all_containers_status() {
   local distros="ubuntu debian arch fedora alpine"
-  local name file alive port pid target started rootfs_target runtime_pids state_label
+  local name file alive port pid target started rootfs_target
+  local has_image storage_label state_label state_glyph
   local running_count=0
 
-  echo ""
-  echo "╔══════════════════════════════════════════════════════════════╗"
-  echo "║              容器运行状态概览                                ║"
-  echo "╠══════════════════════════════════════════════════════════════╣"
+  # 一次性扫 /proc，建立 root→pid 映射，避免每个发行版都重复扫
+  # 使用 ls -l（单次系统调用批处理）大幅快于 readlink 循环
+  local proc_dump
+  proc_dump=$(ls -l /proc/[0-9]*/root 2>/dev/null \
+    | awk '
+        /-> \/(mnt\/chroot-rootfs|data\/local\/chroot|data\/data\/com\.termux\/files\/usr\/var\/lib\/proot-distro)/ {
+          # $NF 是 "→ 后的目标路径"
+          target=$NF
+          # 第8字段是 "/proc/N/root"
+          for (i=1;i<=NF;i++) if ($i ~ /^\/proc\/[0-9]+\/root$/) { src=$i; break }
+          n=split(src, parts, "/")
+          if (n>=3) print parts[3], target
+        }')
+
+  _pids_for_target() {
+    local t="$1"
+    awk -v t="$t" '$2==t || index($2,t"/")==1 {print $1}' <<<"$proc_dump" | sort -u | xargs 2>/dev/null
+  }
+
+  printf '\n  Containers\n'
+  printf '  %s\n' '------------------------------------------------------------'
+  printf '  %s %-8s %-7s %-6s %-6s %-6s %s\n' ' ' 'distro' 'state' 'pid' 'port' 'store' 'started'
+  printf '  %s\n' '------------------------------------------------------------'
 
   for name in $distros; do
-    file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${name}.info"
+    file="$STATE_DIR/chroot-mcp-daemon-${name}.info"
     alive="no"
     port="-"
     pid="-"
     target="-"
     started="-"
-    state_label="未运行"
+    state_label="-"
+    state_glyph="·"
     rootfs_target="$(find_existing_rootfs "$name")"
-    runtime_pids=""
+    has_image=0
+    [ -f "/data/local/chroot-images/${name}.img" ] && has_image=1
+
+    if [ "$has_image" -eq 1 ]; then
+      storage_label='image'
+    elif [ -n "$rootfs_target" ]; then
+      storage_label='dir'
+    else
+      storage_label='-'
+    fi
 
     if [ -f "$file" ]; then
       DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
@@ -308,34 +707,44 @@ show_all_containers_status() {
         started="${DAEMON_STARTED_AT:-}"
         if pid_root_matches_target "$pid" "$target"; then
           alive="yes"
-          state_label="后台"
+          state_label='running'
+          state_glyph='●'
           running_count=$((running_count + 1))
         fi
       fi
     fi
 
     if [ "$alive" = "no" ] && [ -n "$rootfs_target" ]; then
-      runtime_pids="$(collect_pids_by_root_prefix "$rootfs_target")"
-      if [ -n "$runtime_pids" ]; then
-        pid="$(first_pid_from_list "$runtime_pids")"
+      local fg_pids
+      fg_pids="$(_pids_for_target "$rootfs_target")"
+      if [ -n "$fg_pids" ]; then
+        pid="${fg_pids%% *}"
         target="$rootfs_target"
         port="-"
         started="-"
         alive="yes"
-        state_label="前台/残留"
+        state_label='live(fg)'
+        state_glyph='◐'
         running_count=$((running_count + 1))
       fi
     fi
 
     if [ "$alive" = "yes" ]; then
-      printf "║  🟢 %-8s %-9s PID=%-6s Port=%-5s %-18s ║\n" "$name" "$state_label" "$pid" "$port" "$started"
+      printf '  %s %-8s %-7s %-6s %-6s %-6s %s\n' \
+        "$state_glyph" "$name" "$state_label" "$pid" "$port" "$storage_label" "$started"
+    elif [ "$has_image" -eq 1 ] || [ -n "$rootfs_target" ]; then
+      printf '  %s %-8s %-7s %-6s %-6s %-6s %s\n' \
+        '○' "$name" 'ready' '-' '-' "$storage_label" '-'
     else
-      printf "║  ⚪ %-8s 未运行                                              ║\n" "$name"
+      printf '  %s %-8s %-7s %-6s %-6s %-6s %s\n' \
+        '·' "$name" 'absent' '-' '-' '-' '-'
     fi
   done
-
-  echo "╚══════════════════════════════════════════════════════════════╝"
-  echo ""
+  printf '  %s\n' '------------------------------------------------------------'
+  printf '  ● running  后台 sshd 在跑（可SFTP/SSH）\n'
+  printf '  ◐ live(fg) 有人在容器里开着前台 shell（无后台 sshd）\n'
+  printf '  ○ ready    已安装但当前未启动\n'
+  printf '  · absent   未安装\n\n'
 
   if [ "$running_count" -gt 0 ]; then
     return 0
@@ -402,10 +811,29 @@ summarize_pid_cmdlines() {
   printf '%s' "$out"
 }
 
+# 早期需要在 daemon_stop / cleanup 路径中使用的挂载工具函数
+# （主体在文件中段，但这些路径在主体定义之前就可能被调用）
+is_mounted() {
+  local dst="$1"
+  grep -Fq " $dst " /proc/self/mountinfo
+}
+
+quick_lazy_umount() {
+  local mp="$1"
+  case "$mp" in
+    "${TARGET:-}/storage/emulated/0"|"${TARGET:-}/sdcard"|"${TARGET:-}/apex")
+      umount -l "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true
+      ;;
+    *)
+      umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+      ;;
+  esac
+}
+
 list_loop_devices_for_image() {
   local image_file="$1"
   [ -n "$image_file" ] || return 0
-  /data/data/com.termux/files/usr/bin/losetup -j "$image_file" 2>/dev/null | awk -F: '{print $1}' | xargs 2>/dev/null || true
+  "$LOSETUP_BIN" -j "$image_file" 2>/dev/null | awk -F: '{print $1}' | xargs 2>/dev/null || true
 }
 
 log_mountpoint_evidence() {
@@ -423,7 +851,7 @@ log_loopdev_evidence() {
   local tag="$1" loopdev="$2"
   local info backing
   [ -n "$loopdev" ] || return 0
-  info=$(/data/data/com.termux/files/usr/bin/losetup "$loopdev" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
+  info=$("$LOSETUP_BIN" "$loopdev" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
   backing=$(basename "$loopdev")
   backing=$(cat "/sys/block/${backing##*/}/loop/backing_file" 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//' || true)
   log "[EVIDENCE][$tag] loopdev=$loopdev info=${info:-none} backing=${backing:-unknown}"
@@ -457,7 +885,7 @@ detach_loop_with_evidence() {
   local tag="${2:-loop_detach}"
   [ -n "$loopdev" ] || return 0
   log_loopdev_evidence "$tag:before" "$loopdev"
-  if /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null; then
+  if "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null; then
     log "[EVIDENCE][$tag] detach_ok loopdev=$loopdev"
     return 0
   fi
@@ -526,6 +954,31 @@ daemon_stop() {
   file="$(get_daemon_info_file)"
   if ! read_daemon_info "$file"; then
     echo "[stop] 未找到后台状态文件: $file"
+    # 即使没有状态文件，也尝试基于 DISTRO_NAME 找出残留进程/挂载并清理
+    local fallback_target fallback_pids fallback_pid
+    fallback_target="$(find_existing_rootfs "${DISTRO_NAME:-}")"
+    if [ -n "$fallback_target" ]; then
+      fallback_pids="$(collect_pids_by_root_prefix "$fallback_target")"
+      if [ -n "$fallback_pids" ]; then
+        fallback_pid="$(first_pid_from_list "$fallback_pids")"
+        echo "[stop] 仍检测到残留进程，转入残留清理: pids=${fallback_pids}"
+        stop_runtime_by_pid_target "$fallback_pid" "$fallback_target" "" "stop-fallback" || return $?
+        return 0
+      fi
+      if grep -Fq " $fallback_target " /proc/self/mountinfo 2>/dev/null; then
+        echo "[stop] 状态文件缺失，但宿主仍有残留挂载，执行 lazy umount: $fallback_target"
+        local host_loopdev mp
+        host_loopdev=$(grep -F " ${fallback_target} " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
+        # 反向 umount 所有 fallback_target 下的子挂载
+        grep -F " $fallback_target" /proc/self/mountinfo 2>/dev/null \
+          | awk '{print $5}' | tac | while read -r mp; do
+            umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+          done
+        umount "$fallback_target" 2>/dev/null || umount -l "$fallback_target" 2>/dev/null || true
+        case "$host_loopdev" in /dev/loop*|/dev/block/loop*) "$LOSETUP_BIN" -d "$host_loopdev" 2>/dev/null || true;; esac
+        return 0
+      fi
+    fi
     return 1
   fi
 
@@ -534,11 +987,32 @@ daemon_stop() {
   if ! pid_root_matches_target "${DAEMON_SSHD_PID}" "${DAEMON_TARGET}"; then
     echo "[stop] 状态文件中的 sshd pid 与目标 rootfs 不匹配或已失效: ${DAEMON_SSHD_PID}"
     rm -f "$file"
-    return 1
+    # pid 已死但宿主可能仍有残留挂载（上次 sshd 被外部 kill / 脚本被中断）
+    if grep -Fq " ${DAEMON_TARGET} " /proc/self/mountinfo 2>/dev/null; then
+      echo "[stop] 检测到宿主残留挂载，执行清理: ${DAEMON_TARGET}"
+      local host_loopdev mp
+      host_loopdev=$(grep -F " ${DAEMON_TARGET} " /proc/self/mountinfo 2>/dev/null | tail -1 | awk -F' - ' '{print $2}' | awk '{print $2}')
+      grep -F " $DAEMON_TARGET" /proc/self/mountinfo 2>/dev/null \
+        | awk '{print $5}' | tac | while read -r mp; do
+          umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+        done
+      umount "$DAEMON_TARGET" 2>/dev/null || umount -l "$DAEMON_TARGET" 2>/dev/null || true
+      case "$host_loopdev" in /dev/loop*|/dev/block/loop*) "$LOSETUP_BIN" -d "$host_loopdev" 2>/dev/null || true;; esac
+    fi
+    return 0
   fi
 
-  echo "[stop] 进入 mount namespace 清理: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET}"
-  nsenter -t "$DAEMON_SSHD_PID" -m -- /data/data/com.termux/files/usr/bin/bash -s -- "$DAEMON_TARGET" "$DAEMON_SSHD_PID" "${DAEMON_IMAGE_LOOPDEV:-}" <<'EOS'
+  # ---- 优雅关停：先 sync 再 SIGTERM 再 umount ----
+  echo "[stop] 第 1 步：进入容器执行 sync，刷出文件缓存"
+  "$NSENTER_BIN" -t "${DAEMON_SSHD_PID}" -m -- "$SH_BIN" -c '
+    sync 2>/dev/null
+    sync 2>/dev/null
+    sleep 0.2
+    sync 2>/dev/null
+  ' 2>/dev/null || true
+
+  echo "[stop] 第 2 步：进入 mount namespace 清理: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET}"
+  "$NSENTER_BIN" -t "$DAEMON_SSHD_PID" -m -- "$BASH_BIN" -s -- "$DAEMON_TARGET" "$DAEMON_SSHD_PID" "${DAEMON_IMAGE_LOOPDEV:-}" <<'EOS'
 TARGET="$1"
 PID="$2"
 LOOPDEV="$3"
@@ -556,14 +1030,22 @@ collect_target_pids() {
     esac
   done | sort -u
 }
+sync 2>/dev/null
 kill "$PID" 2>/dev/null || true
 sleep 1
 for p in $(collect_target_pids); do kill "$p" 2>/dev/null || true; done
 sleep 1
+sync 2>/dev/null
 kill -9 "$PID" 2>/dev/null || true
 for p in $(collect_target_pids); do kill -9 "$p" 2>/dev/null || true; done
+sync 2>/dev/null
 for m in \
   "$TARGET/etc/resolv.conf" \
+  "$TARGET/sys/kernel/tracing" \
+  "$TARGET/sys/kernel/debug" \
+  "$TARGET/mi_ext" \
+  "$TARGET/mnt" \
+  "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
@@ -592,7 +1074,7 @@ for m in \
   "$TARGET/proc"
   do
   case "$m" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
       umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
       ;;
     *)
@@ -601,8 +1083,12 @@ for m in \
   esac
 done
 rm -f "$TARGET/.chroot_marker" 2>/dev/null || true
+sync 2>/dev/null
+# 卸载前 remount 为只读，确保 ext4 落最终 commit
+mount -o remount,ro "$TARGET" 2>/dev/null || true
+sync 2>/dev/null
 umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null || true
-[ -n "$LOOPDEV" ] && /data/data/com.termux/files/usr/bin/losetup -d "$LOOPDEV" 2>/dev/null || true
+[ -n "$LOOPDEV" ] && "$LOSETUP_BIN" -d "$LOOPDEV" 2>/dev/null || true
 EOS
   local rc=$?
 
@@ -620,7 +1106,7 @@ EOS
       esac
       echo "[stop] 清理当前命名空间残留镜像挂载: ${DAEMON_TARGET} ${host_loopdev}"
       quick_lazy_umount "${DAEMON_TARGET}"
-      [ -n "$host_loopdev" ] && /data/data/com.termux/files/usr/bin/losetup -d "$host_loopdev" 2>/dev/null || true
+      [ -n "$host_loopdev" ] && "$LOSETUP_BIN" -d "$host_loopdev" 2>/dev/null || true
       [ -n "${DAEMON_IMAGE_FILE:-}" ] && cleanup_stale_loop_devices_for_image "${DAEMON_IMAGE_FILE}" "${DAEMON_TARGET}" || true
     fi
   fi
@@ -669,8 +1155,11 @@ enter_existing_container() {
 
   echo_info "直接进入已运行容器: pid=$ns_pid target=$target"
 
-  # 使用 /system/bin/chroot 确保 namespace 内可找到 chroot 命令
-  nsenter -t "$ns_pid" -m /data/data/com.termux/files/usr/bin/sh -c     "cd '$target' && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /system/bin/chroot . /bin/bash -i"
+  # 优先用 rootfs 自带的 bash；若 rootfs 没 bash（alpine/arch 默认），退回 /bin/sh
+  local in_shell="/bin/bash"
+  [ -x "$target/bin/bash" ] || in_shell="/bin/sh"
+  "$NSENTER_BIN" -t "$ns_pid" -m "$SH_BIN" -c \
+    "cd '$target' && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $CHROOT_BIN . $in_shell -i"
 }
 
 
@@ -685,7 +1174,7 @@ stop_runtime_by_pid_target() {
   [ -d "/proc/$ns_pid" ] || { echo "[stop] 目标 pid 不存在: $ns_pid"; return 1; }
 
   echo "[stop] 进入 mount namespace 清理(${label}): pid=${ns_pid} target=${target}"
-  nsenter -t "$ns_pid" -m -- /data/data/com.termux/files/usr/bin/bash -s -- "$target" "$ns_pid" "$loopdev" <<'EOS'
+  "$NSENTER_BIN" -t "$ns_pid" -m -- "$BASH_BIN" -s -- "$target" "$ns_pid" "$loopdev" <<'EOS'
 TARGET="$1"
 PID="$2"
 LOOPDEV="$3"
@@ -703,14 +1192,22 @@ collect_target_pids() {
     esac
   done | sort -u
 }
+sync 2>/dev/null
 kill "$PID" 2>/dev/null || true
 sleep 1
 for p in $(collect_target_pids); do kill "$p" 2>/dev/null || true; done
 sleep 1
+sync 2>/dev/null
 kill -9 "$PID" 2>/dev/null || true
 for p in $(collect_target_pids); do kill -9 "$p" 2>/dev/null || true; done
+sync 2>/dev/null
 for m in \
   "$TARGET/etc/resolv.conf" \
+  "$TARGET/sys/kernel/tracing" \
+  "$TARGET/sys/kernel/debug" \
+  "$TARGET/mi_ext" \
+  "$TARGET/mnt" \
+  "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
   "$TARGET/sdcard" \
   "$TARGET/metadata" \
@@ -739,7 +1236,7 @@ for m in \
   "$TARGET/proc"
   do
   case "$m" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
       umount -l "$m" 2>/dev/null || umount "$m" 2>/dev/null || true
       ;;
     *)
@@ -748,8 +1245,12 @@ for m in \
   esac
 done
 rm -f "$TARGET/.chroot_marker" 2>/dev/null || true
+sync 2>/dev/null
+# 卸载前 remount 为只读，确保 ext4 落最终 commit
+mount -o remount,ro "$TARGET" 2>/dev/null || true
+sync 2>/dev/null
 umount "$TARGET" 2>/dev/null || umount -l "$TARGET" 2>/dev/null || true
-[ -n "$LOOPDEV" ] && /data/data/com.termux/files/usr/bin/losetup -d "$LOOPDEV" 2>/dev/null || true
+[ -n "$LOOPDEV" ] && "$LOSETUP_BIN" -d "$LOOPDEV" 2>/dev/null || true
 EOS
   local rc=$?
 
@@ -767,7 +1268,7 @@ EOS
       esac
       echo "[stop] 清理当前命名空间残留挂载: ${target} ${host_loopdev}"
       quick_lazy_umount "${target}"
-      [ -n "$host_loopdev" ] && /data/data/com.termux/files/usr/bin/losetup -d "$host_loopdev" 2>/dev/null || true
+      [ -n "$host_loopdev" ] && "$LOSETUP_BIN" -d "$host_loopdev" 2>/dev/null || true
       [ -n "$host_loopdev" ] && [ -f "${IMAGE_FILE:-}" ] && cleanup_stale_loop_devices_for_image "${IMAGE_FILE}" "${target}" || true
     fi
   fi
@@ -778,15 +1279,7 @@ EOS
 # ==============================================
 # rootfs 选择 / 迁移 / 镜像挂载
 # ==============================================
-get_rootfs_name() {
-  if [ -n "${DISTRO_NAME:-}" ]; then
-    echo "$DISTRO_NAME"
-  elif [ -n "${TARGET:-}" ]; then
-    basename "$TARGET"
-  else
-    echo ubuntu
-  fi
-}
+# get_rootfs_name 已在文件顶部定义
 
 set_image_paths() {
   local name
@@ -910,7 +1403,7 @@ resize_rootfs_image() {
   if read_daemon_info "$daemon_file" 2>/dev/null; then
     if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$TARGET}"; then
       daemon_alive=1
-      echo_warn "检测到容器正在运行: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET:-$TARGET}"
+      echo_warn "检测到后台容器正在运行: pid=${DAEMON_SSHD_PID} target=${DAEMON_TARGET:-$TARGET}"
       if has_interactive_tty; then
         stop_confirm=$(choose_option "扩容前需要安全停止运行中的容器，是否继续?" "继续并安全停止" "取消")
         [ "$stop_confirm" = "继续并安全停止" ] || { echo "[resize-image] 已取消"; return 1; }
@@ -922,13 +1415,40 @@ resize_rootfs_image() {
     fi
   fi
 
+  # 查找前台/残留容器进程（无 daemon-info 但仍有进程在 chroot 里跑的情况，例如交互式 shell 或 live(fg)）
+  local resize_target_path live_pids live_pid
+  resize_target_path="$(find_existing_rootfs "$(get_rootfs_name)")"
+  if [ -n "$resize_target_path" ]; then
+    live_pids="$(collect_pids_by_root_prefix "$resize_target_path")"
+  fi
+  if [ -n "$live_pids" ]; then
+    live_pid="$(first_pid_from_list "$live_pids")"
+    echo_warn "检测到前台/残留容器进程占用: pids=${live_pids}（target=${resize_target_path}）"
+    if has_interactive_tty; then
+      stop_confirm=$(choose_option "扩容前需要先终止这些进程并卸载，是否继续?" "继续并安全终止" "取消")
+      [ "$stop_confirm" = "继续并安全终止" ] || { echo "[resize-image] 已取消"; return 1; }
+    else
+      echo "[resize-image] 容器仍有进程在跑(${live_pids})，请先 --stop 或退出 chroot 后重试"
+      return 1
+    fi
+    stop_runtime_by_pid_target "$live_pid" "$resize_target_path" "" "live(fg)" \
+      || { echo "[resize-image] 终止前台/残留容器失败"; return 1; }
+    sleep 1
+  fi
+
   cleanup_current_namespace_stale_image_mount
   loopdev="$(get_image_loopdev_for_file "$image_file" || true)"
   if [ -n "$loopdev" ]; then
     if ensure_loop_device_node "$loopdev"; then
       if loopdev_has_active_mounts "$loopdev"; then
-        echo "[resize-image] 镜像仍处于挂载状态，请先退出相关容器后重试: $loopdev"
-        return 1
+        echo_warn "[resize-image] 镜像仍处于挂载状态，强制 lazy umount: $loopdev"
+        local lp_mp
+        lp_mp=$(grep -F " $loopdev " /proc/self/mountinfo 2>/dev/null | awk '{print $5}' | head -1)
+        [ -n "$lp_mp" ] && (umount "$lp_mp" 2>/dev/null || umount -l "$lp_mp" 2>/dev/null || true)
+        if loopdev_has_active_mounts "$loopdev"; then
+          echo "[resize-image] 仍有挂载残留，请重启手机后再扩容: $loopdev"
+          return 1
+        fi
       fi
       losetup -d "$loopdev" 2>/dev/null || {
         echo "[resize-image] 无法释放残留 loop 设备: $loopdev"
@@ -950,20 +1470,20 @@ resize_rootfs_image() {
     truncate -s "${target_mib}M" "$image_file" || { echo "[resize-image] truncate 失败"; return 1; }
   fi
 
-  loopdev=$(/data/data/com.termux/files/usr/bin/losetup -f --show "$image_file" 2>/dev/null) || { echo "[resize-image] loop 绑定失败"; return 1; }
+  loopdev=$("$LOSETUP_BIN" -f --show "$image_file" 2>/dev/null) || { echo "[resize-image] loop 绑定失败"; return 1; }
   need_detach=1
   echo_info "[resize-image] 已绑定 loop: $loopdev"
 
   e2fsck -fy "$loopdev"
   fsck_rc=$?
   if [ "$fsck_rc" -gt 3 ]; then
-    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || true
     echo "[resize-image] e2fsck 失败(exit=$fsck_rc)，请检查镜像状态"
     return 1
   fi
 
   resize2fs "$loopdev" || {
-    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || true
     echo "[resize-image] resize2fs 失败"
     return 1
   }
@@ -971,7 +1491,7 @@ resize_rootfs_image() {
   dumpe2fs -h "$loopdev" 2>/dev/null | grep -E 'Block count|Free blocks|Block size|Filesystem state' || true
 
   if [ "$need_detach" -eq 1 ]; then
-    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || {
+    "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || {
       echo_warn "[resize-image] loop 设备释放失败，请手动检查: $loopdev"
       return 1
     }
@@ -1005,9 +1525,28 @@ mount_rootfs_image_if_exists() {
     cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
   fi
 
-  IMAGE_LOOPDEV=$(/data/data/com.termux/files/usr/bin/losetup -f --show "$IMAGE_FILE" 2>/dev/null) || { echo "错误: 镜像 loop 绑定失败: $IMAGE_FILE" >&2; exit 1; }
+  IMAGE_LOOPDEV=$("$LOSETUP_BIN" -f --show "$IMAGE_FILE" 2>/dev/null) || { echo "错误: 镜像 loop 绑定失败: $IMAGE_FILE" >&2; exit 1; }
   log_loopdev_evidence "image_mount_attach" "$IMAGE_LOOPDEV"
-  mount -t ext4 "$IMAGE_LOOPDEV" "$IMAGE_MOUNTPOINT" || {
+
+  # 启动前安全 fsck：-p 模式只修可自动修复的问题（重放 journal、清 needs_recovery 标记），通常 1-3s
+  if command -v e2fsck >/dev/null 2>&1; then
+    echo_info "镜像挂载前自动 e2fsck -p（修复可恢复错误，跳过严重错误）..."
+    e2fsck -p "$IMAGE_LOOPDEV" >/dev/null 2>&1
+    local fsck_rc=$?
+    case "$fsck_rc" in
+      0) echo_info "e2fsck 通过：镜像状态干净" ;;
+      1) echo_info "e2fsck 修复了一些可恢复错误（rc=1）" ;;
+      2) echo_warn "e2fsck 修复后建议重启设备（rc=2）但镜像可挂载" ;;
+      4|8|16|32|128|*)
+        detach_loop_with_evidence "$IMAGE_LOOPDEV" "image_mount_attach_fsck_fail"
+        echo_err "e2fsck 检测到严重错误(rc=$fsck_rc)，请先执行: $0 --resize-image --distro $(get_rootfs_name) 或手动 e2fsck -fy $IMAGE_FILE"
+        ;;
+    esac
+  else
+    echo_warn "未找到 e2fsck，跳过启动前修复检查"
+  fi
+
+  mount -t ext4 -o noatime "$IMAGE_LOOPDEV" "$IMAGE_MOUNTPOINT" || {
     detach_loop_with_evidence "$IMAGE_LOOPDEV" "image_mount_attach_fail"
     echo "错误: 镜像挂载失败: $IMAGE_FILE -> $IMAGE_MOUNTPOINT" >&2
     exit 1
@@ -1046,9 +1585,9 @@ migrate_rootfs_to_image() {
   truncate -s "${size_mib}M" "$tmpimg" || return 1
   /system/bin/mkfs.ext4 -F "$tmpimg" >/dev/null 2>&1 || { rm -f "$tmpimg"; echo "[migrate-image] mkfs.ext4 失败"; return 1; }
 
-  loopdev=$(/data/data/com.termux/files/usr/bin/losetup -f --show "$tmpimg" 2>/dev/null) || { rm -f "$tmpimg"; echo "[migrate-image] loop 绑定失败"; return 1; }
+  loopdev=$("$LOSETUP_BIN" -f --show "$tmpimg" 2>/dev/null) || { rm -f "$tmpimg"; echo "[migrate-image] loop 绑定失败"; return 1; }
   mount -t ext4 "$loopdev" "$IMAGE_MOUNTPOINT" || {
-    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || true
     rm -f "$tmpimg"
     echo "[migrate-image] ext4 镜像挂载失败"
     return 1
@@ -1056,7 +1595,7 @@ migrate_rootfs_to_image() {
 
   (cd "$src" && tar --numeric-owner --xattrs --acls -cpf - .) | (cd "$IMAGE_MOUNTPOINT" && tar --numeric-owner --xattrs --acls -xpf -) || {
     umount "$IMAGE_MOUNTPOINT" 2>/dev/null || umount -l "$IMAGE_MOUNTPOINT" 2>/dev/null || true
-    /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+    "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || true
     rm -f "$tmpimg"
     echo "[migrate-image] rootfs 复制失败"
     return 1
@@ -1066,7 +1605,7 @@ migrate_rootfs_to_image() {
   chmod 755 "$IMAGE_MOUNTPOINT" 2>/dev/null || true
   sync
   umount "$IMAGE_MOUNTPOINT" 2>/dev/null || umount -l "$IMAGE_MOUNTPOINT" 2>/dev/null || true
-  /data/data/com.termux/files/usr/bin/losetup -d "$loopdev" 2>/dev/null || true
+  "$LOSETUP_BIN" -d "$loopdev" 2>/dev/null || true
   mv "$tmpimg" "$IMAGE_FILE" || { rm -f "$tmpimg"; echo "[migrate-image] 保存镜像失败"; return 1; }
   [ -x /system/bin/restorecon ] && /system/bin/restorecon "$IMAGE_FILE" 2>/dev/null || true
   echo "[migrate-image] 完成: $IMAGE_FILE"
@@ -1351,41 +1890,266 @@ ask_text() {
 download_rootfs_archive() {
   local url="$1"
   local rootfs_dir="$2"
-  local archive="/data/data/com.termux/files/usr/tmp/rootfs-$(date +%s).tar"
+  local archive_name archive
+
+  # 保留原始扩展名，便于 tar 自动识别压缩格式（.xz/.gz/.bz2）
+  archive_name="rootfs-$(date +%s)"
+  case "$url" in
+    *.tar.xz|*.txz) archive_name="${archive_name}.tar.xz" ;;
+    *.tar.gz|*.tgz) archive_name="${archive_name}.tar.gz" ;;
+    *.tar.bz2|*.tbz2) archive_name="${archive_name}.tar.bz2" ;;
+    *.tar.zst) archive_name="${archive_name}.tar.zst" ;;
+    *.tar)          archive_name="${archive_name}.tar" ;;
+    *)              archive_name="${archive_name}.tar.xz" ;;  # 默认按 xz 处理（LXC 默认）
+  esac
+  archive="$STATE_DIR/$archive_name"
 
   mkdir -p "$rootfs_dir" || return 1
-  curl -fL "$url" -o "$archive" || return 1
-  tar -xf "$archive" -C "$rootfs_dir" || return 1
+  echo_info "下载: $url"
+  echo_info "  → $archive"
+  if ! curl -fL --retry 3 --retry-delay 2 -C - "$url" -o "$archive" 2>&1; then
+    echo_warn "下载失败: $url"
+    rm -f "$archive" 2>/dev/null
+    return 1
+  fi
+  local size
+  size=$(stat -c '%s' "$archive" 2>/dev/null || echo 0)
+  if [ "${size:-0}" -lt 1048576 ]; then
+    echo_warn "下载文件过小($size 字节)，可能是 404 / 重定向页面"
+    rm -f "$archive" 2>/dev/null
+    return 1
+  fi
+
+  echo_info "解压: $archive → $rootfs_dir"
+  local tar_rc=0
+  case "$archive" in
+    *.tar.xz|*.txz)   tar -xJpf "$archive" -C "$rootfs_dir" 2>&1 || tar_rc=$? ;;
+    *.tar.gz|*.tgz)   tar -xzpf "$archive" -C "$rootfs_dir" 2>&1 || tar_rc=$? ;;
+    *.tar.bz2|*.tbz2) tar -xjpf "$archive" -C "$rootfs_dir" 2>&1 || tar_rc=$? ;;
+    *.tar.zst)        tar --zstd -xpf "$archive" -C "$rootfs_dir" 2>&1 || tar_rc=$? ;;
+    *)                tar -xpf "$archive" -C "$rootfs_dir" 2>&1 || tar_rc=$? ;;
+  esac
+  if [ "$tar_rc" -ne 0 ]; then
+    echo_warn "tar 解压失败 (rc=$tar_rc)，归档可能损坏或缺少对应解压器"
+    rm -f "$archive" 2>/dev/null
+    return 1
+  fi
+
   chown root:root "$rootfs_dir" 2>/dev/null || true
   chmod 755 "$rootfs_dir" 2>/dev/null || true
   rm -f "$archive" 2>/dev/null || true
+  return 0
 }
 
-bootstrap_rootfs_from_termux_source() {
+# 解析 LXC images index 页面，返回最新快照目录的 rootfs.tar.xz URL
+_resolve_lxc_latest_rootfs() {
+  local base="$1"
+  local snapshots latest
+  snapshots=$(curl -fsSL --max-time 30 "$base" 2>/dev/null \
+    | grep -oE 'href="[0-9A-Za-z_%]+/"' \
+    | sed 's/href="//;s/"//;s|/$||' \
+    | grep -E '^[0-9]{8}' \
+    | sort)
+  latest=$(printf '%s\n' "$snapshots" | tail -1)
+  [ -n "$latest" ] || return 1
+  echo "${base}${latest}/rootfs.tar.xz"
+}
+
+# 解析 alpine dl-cdn 列表页，返回当前 minirootfs 的 tar.gz URL
+_resolve_alpine_latest_rootfs() {
+  local base="$1"
+  local fname
+  fname=$(curl -fsSL --max-time 30 "$base" 2>/dev/null \
+    | grep -oE 'alpine-minirootfs-[0-9.]+-aarch64\.tar\.gz' \
+    | sort -V | tail -1)
+  [ -n "$fname" ] || return 1
+  echo "${base}${fname}"
+}
+
+# 内置 arm64 rootfs 下载源（动态解析最新版本）
+get_builtin_rootfs_urls() {
   local distro="$1"
-  local pd_root="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$distro"
-  if ! command -v proot-distro >/dev/null 2>&1; then
-    # 交互模式兜底：自动安装 proot-distro（仅用于获取内置rootfs源）
-    if command -v pkg >/dev/null 2>&1; then
-      pkg install -y proot-distro >/dev/null 2>&1 || return 1
-    fi
-    command -v proot-distro >/dev/null 2>&1 || return 1
-  fi
-  # 若已存在可用rootfs，直接复用（避免 "already installed" 触发失败）
-  if [ -x "$pd_root/bin/bash" ]; then
-    TARGET="$pd_root"
+  case "$distro" in
+    alpine)
+      local u
+      u="$(_resolve_alpine_latest_rootfs 'https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/' 2>/dev/null)"
+      [ -n "$u" ] && printf '%s\n' "$u"
+      u="$(_resolve_alpine_latest_rootfs 'https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/aarch64/' 2>/dev/null)"
+      [ -n "$u" ] && printf '%s\n' "$u"
+      ;;
+    ubuntu)
+      printf '%s\n' \
+        'https://cloud-images.ubuntu.com/minimal/releases/noble/release/ubuntu-24.04-minimal-cloudimg-arm64-root.tar.xz' \
+        'https://cloud-images.ubuntu.com/minimal/releases/jammy/release/ubuntu-22.04-minimal-cloudimg-arm64-root.tar.xz'
+      ;;
+    debian)
+      local u
+      u="$(_resolve_lxc_latest_rootfs 'https://images.linuxcontainers.org/images/debian/bookworm/arm64/default/' 2>/dev/null)"
+      [ -n "$u" ] && printf '%s\n' "$u"
+      u="$(_resolve_lxc_latest_rootfs 'https://images.linuxcontainers.org/images/debian/trixie/arm64/default/' 2>/dev/null)"
+      [ -n "$u" ] && printf '%s\n' "$u"
+      ;;
+    arch)
+      printf '%s\n' \
+        'http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz'
+      ;;
+    fedora)
+      local u v
+      # Fedora 索引页里只有数字版本号目录，挑最新
+      v=$(curl -fsSL --max-time 30 'https://images.linuxcontainers.org/images/fedora/' 2>/dev/null \
+        | grep -oE 'href="[0-9]+/"' | sed 's/href="//;s|/"||' | sort -n | tail -1)
+      if [ -n "$v" ]; then
+        u="$(_resolve_lxc_latest_rootfs "https://images.linuxcontainers.org/images/fedora/${v}/arm64/default/" 2>/dev/null)"
+        [ -n "$u" ] && printf '%s\n' "$u"
+      fi
+      ;;
+  esac
+}
+
+ensure_proot_distro_installed() {
+  if command -v proot-distro >/dev/null 2>&1; then
     return 0
   fi
-
-  proot-distro install "$distro" >/dev/null 2>&1 || true
-
-  # 某些机型/环境下 proot-distro 会返回非0，但rootfs可能已成功落盘
-  if [ -x "$pd_root/bin/bash" ]; then
-    TARGET="$pd_root"
+  if [ -x /data/data/com.termux/files/usr/bin/proot-distro ]; then
     return 0
   fi
-
+  echo_warn '未检测到 proot-distro，尝试通过 pkg 自动安装（需要联网）...'
+  if [ -x /data/data/com.termux/files/usr/bin/pkg ]; then
+    /data/data/com.termux/files/usr/bin/pkg install -y proot-distro >/dev/null 2>&1 || true
+  fi
+  if [ -x /data/data/com.termux/files/usr/bin/proot-distro ]; then
+    echo_info 'proot-distro 已自动安装'
+    return 0
+  fi
   return 1
+}
+
+# 通过 proot-distro 取 rootfs 到 termux 内置目录，再让 auto_migrate 把它搬到 /data/local/chroot
+fetch_rootfs_via_proot_distro() {
+  local distro="$1"
+  local pd_alias="$distro"
+  case "$distro" in
+    arch) pd_alias='archlinux' ;;
+  esac
+  local pd_root="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$pd_alias"
+  local pd_plugins_dir="/data/data/com.termux/files/usr/etc/proot-distro"
+  local pd_default_plugin="$pd_plugins_dir/$pd_alias.sh"
+  local pd_override_plugin="$pd_plugins_dir/$pd_alias.override.sh"
+  local override_created=0
+
+  ensure_proot_distro_installed || return 1
+
+  if [ -x "$pd_root/bin/sh" ] || [ -x "$pd_root/bin/bash" ]; then
+    echo_info "复用 proot-distro 已有 rootfs: $pd_root"
+  else
+    echo_info "通过 proot-distro 下载 $distro（${pd_alias}）..."
+    echo_info "（首次下载较大，跨网慢一些。日志: $LOG_FILE）"
+
+    # 已知问题：debian 等发行版的 distro_setup 会跑 dpkg-reconfigure locales，
+    # 在 root+Termux 环境下经常以非 0 退出，导致 proot-distro 触发"失败清理"
+    # 把整个 rootfs 目录删除。我们写一个 override 跳过 locales 钩子；rootfs 落
+    # 盘后立刻会被我们 auto-migrate 到 ext4 镜像，locales 后续可在容器内补。
+    if [ -f "$pd_default_plugin" ] && [ ! -f "$pd_override_plugin" ]; then
+      mkdir -p "$pd_plugins_dir" 2>/dev/null || true
+      {
+        # 透传 TARBALL_URL/SHA256 等元数据，仅替换 distro_setup
+        grep -E '^(DISTRO_NAME|DISTRO_COMMENT|TARBALL_URL|TARBALL_SHA256|DISTRO_TYPE)=' "$pd_default_plugin" 2>/dev/null
+        echo
+        echo '# Override generated by chroot-mcp-safe.sh: skip distro_setup hook'
+        echo '# (locales/dpkg-reconfigure failures wipe the rootfs on root+Termux).'
+        echo 'distro_setup() { :; }'
+      } > "$pd_override_plugin" 2>/dev/null && override_created=1
+      [ "$override_created" -eq 1 ] && echo_info "已写入临时 override 跳过 distro_setup: $pd_override_plugin"
+    fi
+
+    local install_log="$STATE_DIR/proot-distro-install-${pd_alias}-$(date +%s).log"
+    /data/data/com.termux/files/usr/bin/proot-distro install "$pd_alias" 2>&1 | tee "$install_log" >&2
+    local rc=${PIPESTATUS[0]}
+
+    # 用完即删 override，避免污染 proot-distro 后续行为
+    if [ "$override_created" -eq 1 ] && [ -f "$pd_override_plugin" ]; then
+      rm -f "$pd_override_plugin" 2>/dev/null || true
+    fi
+
+    if [ -x "$pd_root/bin/sh" ] || [ -x "$pd_root/bin/bash" ]; then
+      echo_info "rootfs 已就绪（即便 proot-distro 退出码=$rc）: $pd_root"
+    else
+      echo_warn "proot-distro install $pd_alias 失败（rc=$rc），日志: $install_log"
+      cat <<INFO >&2
+排查建议：
+  1. 网络是否可达（Github/curl 镜像可能被墙），可换 wifi 或开代理；
+  2. 已下载的部分残留可清理: rm -rf $pd_root
+  3. 改用「我自己提供URL」，手动下 arm64 rootfs tar 包；
+  4. 若上次下载未完成可再次执行该选项，proot-distro 会续传或重试。
+INFO
+      return 1
+    fi
+  fi
+
+  # alpine/arch 等可能没有 /bin/bash —— 注入兼容性最小集
+  if [ -x "$pd_root/bin/sh" ] && [ ! -x "$pd_root/bin/bash" ]; then
+    case "$distro" in
+      alpine)
+        /data/data/com.termux/files/usr/bin/proot-distro login alpine -- sh -lc 'apk add --no-cache bash' >/dev/null 2>&1 || true
+        ;;
+      arch)
+        /data/data/com.termux/files/usr/bin/proot-distro login archlinux -- sh -lc 'pacman -Sy --noconfirm bash' >/dev/null 2>&1 || true
+        ;;
+    esac
+  fi
+
+  # 设置目标到 termux 内置路径，主流程的 auto_migrate 会搬到 /data/local/chroot/$distro
+  TARGET="$pd_root"
+  AUTO_MIGRATE=1
+  return 0
+}
+
+# 通过内置 URL 表直接拉 tar 包到 /data/local/chroot/<distro>
+fetch_rootfs_via_builtin_urls() {
+  local distro="$1"
+  local target_dir="/data/local/chroot/$distro"
+  local urls url
+  echo_info "正在解析 $distro 最新 rootfs URL..."
+  urls="$(get_builtin_rootfs_urls "$distro")"
+  if [ -z "$urls" ]; then
+    echo_warn "无法解析 $distro 的内置 URL（可能是网络问题）"
+    return 1
+  fi
+
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    echo_info "尝试下载: $url"
+    rm -rf "$target_dir" 2>/dev/null || true
+    if download_rootfs_archive "$url" "$target_dir"; then
+      TARGET="$target_dir"
+      ROOTFS_EXPLICIT=1
+      echo_info "rootfs 已落盘: $target_dir"
+      return 0
+    fi
+    echo_warn "失败，尝试下一候选..."
+  done <<EOF
+$urls
+EOF
+  return 1
+}
+
+# 用户手输 URL
+fetch_rootfs_via_manual_url() {
+  local distro="$1" url="$2" target_dir
+  [ -n "$url" ] || return 1
+  target_dir="/data/local/chroot/$distro"
+  rm -rf "$target_dir" 2>/dev/null || true
+  if download_rootfs_archive "$url" "$target_dir"; then
+    TARGET="$target_dir"
+    ROOTFS_EXPLICIT=1
+    return 0
+  fi
+  return 1
+}
+
+# 旧 API 保留：保持向后兼容
+bootstrap_rootfs_from_termux_source() {
+  fetch_rootfs_via_proot_distro "$1"
 }
 
 apply_distro_preset() {
@@ -1422,12 +2186,16 @@ find_existing_rootfs() {
   local image_file="/data/local/chroot-images/${distro}.img"
   local local_rootfs="/data/local/chroot/$distro"
   local proot_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/$distro"
+  # proot-distro 的 arch 别名是 archlinux
+  case "$distro" in
+    arch) proot_rootfs="/data/data/com.termux/files/usr/var/lib/proot-distro/installed-rootfs/archlinux" ;;
+  esac
 
   if [ -f "$image_file" ]; then
     echo "$image_rootfs"
-  elif [ -d "$local_rootfs" ]; then
+  elif [ -d "$local_rootfs" ] && { [ -x "$local_rootfs/bin/sh" ] || [ -x "$local_rootfs/bin/bash" ]; }; then
     echo "$local_rootfs"
-  elif [ -d "$proot_rootfs" ]; then
+  elif [ -d "$proot_rootfs" ] && { [ -x "$proot_rootfs/bin/sh" ] || [ -x "$proot_rootfs/bin/bash" ]; }; then
     echo "$proot_rootfs"
   else
     echo ""
@@ -1471,173 +2239,359 @@ print_install_guide() {
 EOF
 }
 
-interactive_wizard() {
-  local action distro url permissive_choice ro_choice fallback_choice rootfs_input existing_rootfs stop_choice stop_distro stop_confirm image_size_input resize_confirm enter_distro enter_file enter_rootfs enter_pids enter_pid enter_target
+show_wizard_help() {
+  cat <<'EOF'
 
-  # 显示容器运行状态概览
+  ========================================================================
+   chroot-mcp-safe 帮助说明（通俗版）
+  ========================================================================
+
+  ── 状态图标含义 ──────────────────────────────────────────────────────
+   ●  running   后台 sshd 已经起来了，可以用 SFTP/SSH 连接
+                （MT 管理器、VS Code Remote 等会用到）
+   ◐  live(fg)  你已经在终端里 chroot 进了容器、开着前台 shell；
+                但没有跑后台 sshd。退出这个 shell 容器就停了。
+                （此时不能 SFTP，因为没监听端口）
+   ○  ready     已经下载或解压好了，但当前没在跑
+   ·  absent    根本还没装这个发行版
+
+   pid    = 后台 sshd / 前台 shell 的进程号（kill 用得上）
+   port   = 后台 sshd 监听的端口（22 太冲突，默认 8023+）
+   store  = image 表示用 ext4 镜像（可扩容/可整存整删）
+            dir   表示直接是目录（proot-distro 风格）
+
+  ── 操作菜单逐项解释 ──────────────────────────────────────────────────
+
+   [1] 进入容器
+       打开一个新终端进入已经在跑的容器内部 shell。
+       适用：状态是 ● running 或 ◐ live(fg) 时；
+       不适用：absent / ready 时（请改用 [2]）。
+
+   [2] 启动 / 安装容器
+       下载或安装一个发行版，并把它跑起来（含后台 sshd）。
+       第一次用某发行版选这个；以后只想再启动也走这里。
+       下载源：proot-distro（推荐，稳定）/ LXC index（更新快）。
+
+   [3] 终止容器
+       安全停掉后台 sshd 容器：先 sync 落盘 → 杀进程 →
+       remount-readonly → umount → losetup -d。
+       数据安全收尾，比直接 kill 干净得多。
+       前台 live(fg) 不在这里处理，直接 exit 那个 shell 即可。
+
+   [4] 扩容镜像
+       把 ext4 镜像从原大小（比如 20G）扩大到目标大小（比如 50G）。
+       会自动：
+         - 检测有没有进程占用（daemon 或 live(fg)）
+         - 提示你确认后安全停止
+         - e2fsck 校验 → 文件 truncate 增大 → resize2fs 扩展
+       注意：只支持扩大，不能缩小（缩小风险高）。
+
+   [5] 查看占用空间
+       列出每个发行版在磁盘上吃了多少：
+         - 镜像文件大小（image 模式）
+         - 容器内已用 / 可用空间
+         - rootfs 目录大小（dir 模式）
+       手机存储紧张时先看这里。
+
+   [6] 删除已下载容器
+       彻底删除指定发行版的镜像 + rootfs 目录 + 状态文件。
+       适合反复测试下载/安装功能时清场。
+       会要求二次确认，不会误删别的。
+
+   [7] 紧急同步刷盘
+       手动把所有挂着的容器内存数据刷写到磁盘。
+       手机要没电了 / 怀疑要异常重启 / 拔U盘前 — 跑这个。
+       它会：
+         - 对每个挂载点 sync
+         - 调用 fsync 强制落盘
+         - 不停容器，只保证数据安全
+       平时不用每次都跑，正常 [3] 终止已经包含同步。
+
+   [8] 查看安装建议
+       打印这个发行版常用编译/开发工具的一键安装命令
+       （build-essential / clang / cmake / rust / go / python 等）。
+       新装容器后照着复制即可。
+
+   [9] 查看帮助/说明
+       就是当前这一页。
+
+  ── 常见问题 ─────────────────────────────────────────────────────────
+
+   Q: 为啥 SFTP 连不上 8024？
+   A: 看状态。如果是 ◐ live(fg)，说明只有前台 shell 没后台 sshd，
+      退出 shell 后选 [2] 重新启动（会自动起 sshd）即可。
+      如果是 ● running 还连不上，检查端口是不是被占（脚本会自动避让），
+      或者 ssh 客户端 -p 端口写错了。
+
+   Q: 扩容时提示 "live(fg)"？
+   A: 你之前在终端里手动 chroot 进过容器，那个 shell 还开着。
+      退出那个 shell（exit / Ctrl-D），或者让脚本帮你安全终止。
+
+   Q: 突然断电会不会丢数据？
+   A: 已启用 ext4 journal + sync barrier。日常断电只丢最后几秒未刷盘
+      的数据，不会损坏文件系统。极端情况下重新挂载会自动 e2fsck 修复。
+      重要操作前可以手动跑 [7] 紧急同步刷盘。
+
+   Q: image 和 dir 模式有啥区别？
+   A: image = 单个 .img 文件（loop 挂载），整存整删、可扩容、性能好；
+      dir   = 直接是目录树（proot-distro 风格），方便随时编辑文件，
+              但 inode 多、删除慢、不能扩容（受限于宿主分区）。
+
+  ========================================================================
+
+EOF
+}
+
+interactive_wizard() {
+  local action distro url existing_rootfs stop_distro stop_confirm image_size_input resize_confirm
+  local enter_distro enter_file enter_rootfs enter_pids enter_pid enter_target
+  local source_choice advanced advanced_choice
+  local install_disto rootfs_input
+
   show_all_containers_status
 
-  action=$(choose_option "选择操作" "直接进入已启动容器" "启动已存在rootfs" "下载rootfs后启动" "安全终止卸载容器" "安全扩容镜像" "只打印安装建议")
+  action=$(choose_option "选择操作" \
+    "进入容器" \
+    "启动 / 安装容器" \
+    "终止容器" \
+    "扩容镜像" \
+    "查看占用空间" \
+    "删除已下载容器" \
+    "紧急同步刷盘" \
+    "查看安装建议" \
+    "查看帮助/说明")
 
-  if [ "$action" = "直接进入已启动容器" ]; then
-    enter_distro=$(choose_option "选择要进入的发行版" ubuntu debian arch fedora alpine)
-    DISTRO_NAME="$enter_distro"
-    apply_distro_preset
-    enter_file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${enter_distro}.info"
-    enter_rootfs="$(find_existing_rootfs "$enter_distro")"
-    enter_pid=""
-    enter_target=""
-
-    if [ -f "$enter_file" ]; then
-      DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
-      if read_daemon_info "$enter_file" && pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$enter_rootfs}"; then
-        enter_pid="${DAEMON_SSHD_PID}"
-        enter_target="${DAEMON_TARGET:-$enter_rootfs}"
-      else
-        rm -f "$enter_file" 2>/dev/null || true
-      fi
-    fi
-
-    if [ -z "$enter_pid" ] && [ -n "$enter_rootfs" ]; then
-      enter_pids="$(collect_pids_by_root_prefix "$enter_rootfs")"
-      if [ -n "$enter_pids" ]; then
-        enter_pid="$(first_pid_from_list "$enter_pids")"
-        enter_target="$enter_rootfs"
-      fi
-    fi
-
-    [ -n "$enter_pid" ] || { echo "错误: 未检测到 ${enter_distro} 的已运行容器" >&2; exit 2; }
-    [ -n "$enter_target" ] || enter_target="$enter_rootfs"
-    enter_existing_container "$enter_pid" "$enter_target"
-    exit $?
-  fi
-
-  # 处理"安全终止卸载容器"选项
-  if [ "$action" = "安全终止卸载容器" ]; then
-    stop_distro=$(choose_option "选择要终止的发行版" ubuntu debian arch fedora alpine)
-    DISTRO_NAME="$stop_distro"
-
-    # 检查该发行版是否正在运行
-    local stop_file="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${stop_distro}.info"
-    if [ ! -f "$stop_file" ]; then
-      echo "该发行版未运行（无状态文件）" >&2
+  case "$action" in
+    "查看帮助/说明")
+      show_wizard_help
       exit 0
-    fi
+      ;;
 
-    # 清空之前读取的变量
-    DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
-    if read_daemon_info "$stop_file"; then
-      if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$(find_existing_rootfs "$stop_distro")}"; then
-        echo "" >&2
-        echo "发行版: $stop_distro" >&2
-        echo "PID: ${DAEMON_SSHD_PID}" >&2
-        echo "Port: ${DAEMON_PORT:-unknown}" >&2
-        echo "Target: ${DAEMON_TARGET:-unknown}" >&2
-        echo "启动时间: ${DAEMON_STARTED_AT:-unknown}" >&2
-        echo "" >&2
+    "查看占用空间")
+      show_all_container_sizes
+      exit 0
+      ;;
 
-        stop_confirm=$(choose_option "确认终止并卸载?" "确认终止" "取消操作")
-        if [ "$stop_confirm" = "确认终止" ]; then
-          echo "[stop] 正在终止 ${stop_distro} 容器..." >&2
-          daemon_stop || { echo "[stop] 终止失败，请检查日志" >&2; exit 1; }
-          echo "[stop] ✅ ${stop_distro} 容器已安全终止并卸载" >&2
+    "紧急同步刷盘")
+      emergency_sync_all
+      exit 0
+      ;;
+
+    "删除已下载容器")
+      local rm_distro rm_confirm
+      rm_distro=$(choose_option "删除哪个发行版" ubuntu debian arch fedora alpine)
+      DISTRO_NAME="$rm_distro"
+      remove_distro_assets "$rm_distro"
+      exit $?
+      ;;
+
+    "进入容器")
+      enter_distro=$(choose_option "进入哪个发行版" ubuntu debian arch fedora alpine)
+      DISTRO_NAME="$enter_distro"
+      apply_distro_preset
+      enter_file="$STATE_DIR/chroot-mcp-daemon-${enter_distro}.info"
+      enter_rootfs="$(find_existing_rootfs "$enter_distro")"
+      enter_pid=""
+      enter_target=""
+
+      if [ -f "$enter_file" ]; then
+        DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+        if read_daemon_info "$enter_file" \
+           && pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$enter_rootfs}"; then
+          enter_pid="${DAEMON_SSHD_PID}"
+          enter_target="${DAEMON_TARGET:-$enter_rootfs}"
         else
-          echo "已取消终止操作" >&2
+          rm -f "$enter_file" 2>/dev/null || true
         fi
-      else
-        echo "该发行版状态文件存在但进程已结束，清理状态文件" >&2
-        rm -f "$stop_file" 2>/dev/null
-        echo "状态文件已清理" >&2
       fi
-    else
-      echo "无法读取状态文件" >&2
-      rm -f "$stop_file" 2>/dev/null
-    fi
-    exit 0
-  fi
 
-  if [ "$action" = "安全扩容镜像" ]; then
-    distro=$(choose_option "选择要扩容的发行版" ubuntu debian arch fedora alpine)
-    DISTRO_NAME="$distro"
-    apply_distro_preset
-    set_image_paths
-    [ -f "$IMAGE_FILE" ] || { echo "错误: 未找到 ${distro} 的镜像文件: $IMAGE_FILE" >&2; exit 2; }
+      if [ -z "$enter_pid" ] && [ -n "$enter_rootfs" ]; then
+        enter_pids="$(collect_pids_by_root_prefix "$enter_rootfs")"
+        if [ -n "$enter_pids" ]; then
+          enter_pid="$(first_pid_from_list "$enter_pids")"
+          enter_target="$enter_rootfs"
+        fi
+      fi
 
-    image_size_input=$(ask_text "输入目标镜像大小GB(例如 50)")
-    if [ -z "$image_size_input" ]; then
-      echo "错误: 未提供目标大小" >&2
-      exit 2
-    fi
-    if ! [[ "$image_size_input" =~ ^[0-9]+$ ]] || [ "$image_size_input" -le 0 ]; then
-      echo "错误: 镜像大小必须是正整数GB" >&2
-      exit 2
-    fi
-    IMAGE_SIZE_GB="$image_size_input"
+      [ -n "$enter_pid" ] || { echo "错误: ${enter_distro} 没有运行中的容器，请改选 \"启动 / 安装容器\"" >&2; exit 2; }
+      [ -n "$enter_target" ] || enter_target="$enter_rootfs"
+      enter_existing_container "$enter_pid" "$enter_target"
+      exit $?
+      ;;
 
-    resize_confirm=$(choose_option "将安全停止容器、执行 e2fsck 和 resize2fs，并使扩容在重启后保持。继续?" "确认扩容" "取消操作")
-    [ "$resize_confirm" = "确认扩容" ] || { echo "已取消扩容操作" >&2; exit 0; }
+    "终止容器")
+      stop_distro=$(choose_option "终止哪个发行版" ubuntu debian arch fedora alpine)
+      DISTRO_NAME="$stop_distro"
+      apply_distro_preset
+      local stop_file="$STATE_DIR/chroot-mcp-daemon-${stop_distro}.info"
+      local stop_rootfs stop_pids stop_pid stop_target
+      stop_rootfs="$(find_existing_rootfs "$stop_distro")"
 
-    RESIZE_IMAGE_MODE=1
-    return 0
-  fi
+      # 路径 A：有 daemon-info（后台 sshd 模式）
+      if [ -f "$stop_file" ]; then
+        DAEMON_TARGET="" DAEMON_PORT="" DAEMON_SSHD_PID="" DAEMON_STARTED_AT=""
+        if read_daemon_info "$stop_file"; then
+          if pid_root_matches_target "${DAEMON_SSHD_PID:-}" "${DAEMON_TARGET:-$stop_rootfs}"; then
+            printf '\n  [后台模式]\n  发行版: %s\n  PID:    %s\n  Port:   %s\n  Target: %s\n  起始:   %s\n\n' \
+              "$stop_distro" "${DAEMON_SSHD_PID}" "${DAEMON_PORT:-?}" "${DAEMON_TARGET:-?}" "${DAEMON_STARTED_AT:-?}" >&2
+            stop_confirm=$(choose_option "确认终止并卸载?" "确认" "取消")
+            if [ "$stop_confirm" = "确认" ]; then
+              daemon_stop || { echo "[stop] 终止失败，请检查日志" >&2; exit 1; }
+              echo "[stop] ${stop_distro} 已安全终止" >&2
+            else
+              echo "已取消" >&2
+            fi
+            exit 0
+          else
+            echo "[stop] 状态文件存在但 pid 已结束，清理: $stop_file" >&2
+            rm -f "$stop_file" 2>/dev/null
+          fi
+        else
+          echo "[stop] 无法读取状态文件，清理: $stop_file" >&2
+          rm -f "$stop_file" 2>/dev/null
+        fi
+      fi
 
+      # 路径 B：无 daemon-info，但 /proc 里仍有 chroot 进程（live(fg) 或残留）
+      if [ -n "$stop_rootfs" ]; then
+        stop_pids="$(collect_pids_by_root_prefix "$stop_rootfs")"
+      fi
+      if [ -n "${stop_pids:-}" ]; then
+        stop_pid="$(first_pid_from_list "$stop_pids")"
+        stop_target="$stop_rootfs"
+        printf '\n  [前台/残留]\n  发行版: %s\n  PIDs:   %s\n  Target: %s\n\n' \
+          "$stop_distro" "$stop_pids" "$stop_target" >&2
+        stop_confirm=$(choose_option "确认强制终止这些进程并卸载?" "确认" "取消")
+        if [ "$stop_confirm" = "确认" ]; then
+          stop_runtime_by_pid_target "$stop_pid" "$stop_target" "" "live(fg)" \
+            || { echo "[stop] 终止前台/残留容器失败" >&2; exit 1; }
+          echo "[stop] ${stop_distro} 前台进程已终止并卸载" >&2
+        else
+          echo "已取消" >&2
+        fi
+        exit 0
+      fi
+
+      echo "${stop_distro} 未运行（无后台状态文件，也无前台进程）" >&2
+      exit 0
+      ;;
+
+    "扩容镜像")
+      distro=$(choose_option "扩容哪个发行版的镜像" ubuntu debian arch fedora alpine)
+      DISTRO_NAME="$distro"
+      apply_distro_preset
+      set_image_paths
+      [ -f "$IMAGE_FILE" ] || { echo "错误: ${distro} 没有镜像: $IMAGE_FILE" >&2; exit 2; }
+      image_size_input=$(ask_text "目标大小GB（例如 50）")
+      [ -z "$image_size_input" ] && { echo "错误: 未提供大小" >&2; exit 2; }
+      [[ "$image_size_input" =~ ^[0-9]+$ ]] && [ "$image_size_input" -gt 0 ] \
+        || { echo "错误: 必须是正整数GB" >&2; exit 2; }
+      IMAGE_SIZE_GB="$image_size_input"
+      resize_confirm=$(choose_option "将停止容器并执行 e2fsck/resize2fs，继续?" "确认" "取消")
+      [ "$resize_confirm" = "确认" ] || { echo "已取消" >&2; exit 0; }
+      RESIZE_IMAGE_MODE=1
+      return 0
+      ;;
+
+    "查看安装建议")
+      distro=$(choose_option "查看哪个发行版的建议" ubuntu debian arch fedora alpine)
+      DISTRO_NAME="$distro"
+      PRINT_INSTALL_GUIDE=1
+      return 0
+      ;;
+
+    "启动 / 安装容器")
+      ;;
+  esac
+
+  # ============================================
+  # 启动 / 安装容器（合并了原 "启动已存在rootfs" 和 "下载rootfs后启动"）
+  # ============================================
   distro=$(choose_option "选择发行版" ubuntu debian arch fedora alpine)
   DISTRO_NAME="$distro"
   apply_distro_preset
+  existing_rootfs="$(find_existing_rootfs "$distro")"
 
-  if [ "$action" = "只打印安装建议" ]; then
-    PRINT_INSTALL_GUIDE=1
-    return 0
+  if [ -n "$existing_rootfs" ]; then
+    TARGET="$existing_rootfs"
+    echo "[info] 复用已有 rootfs: $TARGET" >&2
+  else
+    # rootfs 不存在 → 进入下载流程
+    source_choice=$(choose_option "${distro} 还未安装，选择下载方式" \
+      "proot-distro（推荐，最稳）" \
+      "内置URL直拉" \
+      "我自己提供URL")
+
+    case "$source_choice" in
+      "proot-distro（推荐，最稳）")
+        ensure_proot_distro_installed || { echo "错误: proot-distro 不可用，请用其它方式" >&2; exit 2; }
+        fetch_rootfs_via_proot_distro "$distro" \
+          || { echo "错误: proot-distro 拉取 ${distro} 失败" >&2; exit 2; }
+        ;;
+      "内置URL直拉")
+        fetch_rootfs_via_builtin_urls "$distro" \
+          || { echo "错误: 内置URL均无法获取 ${distro} rootfs，请改用 proot-distro" >&2; exit 2; }
+        ;;
+      "我自己提供URL")
+        url=$(ask_text "${distro} arm64 rootfs tar/tar.xz/tar.gz 下载URL")
+        fetch_rootfs_via_manual_url "$distro" "$url" \
+          || { echo "错误: 下载/解压失败" >&2; exit 2; }
+        ;;
+    esac
+    AUTO_MIGRATE_IMAGE=1   # 默认搬到 ext4 镜像
   fi
 
-  if [ "$action" = "启动已存在rootfs" ]; then
-    existing_rootfs=$(find_existing_rootfs "$distro")
-    if [ -n "$existing_rootfs" ]; then
-      TARGET="$existing_rootfs"
-      echo "已复用现有rootfs: $TARGET" >&2
-    else
-      echo "错误: 未找到 ${distro} 的现有rootfs，请改选“下载rootfs后启动”或使用 --rootfs 指定路径。" >&2
-      exit 2
-    fi
+  # 端口选择
+  local default_port port_input
+  default_port="$(get_default_distro_sshd_port)"
+  port_input=$(ask_text "sshd 端口（留空使用 ${default_port}，被占用会自动重选）")
+  if [ -n "$port_input" ]; then
+    [[ "$port_input" =~ ^[0-9]+$ ]] && [ "$port_input" -ge 1 ] && [ "$port_input" -le 65535 ] \
+      || { echo "错误: 端口必须是 1-65535 整数" >&2; exit 2; }
+    SSHD_PORT_EXPLICIT="$port_input"
   fi
 
-  if [ "$action" = "下载rootfs后启动" ]; then
-    rootfs_input=$(ask_text "输入rootfs目录(默认 /data/local/chroot/$distro)")
-    [ -z "$rootfs_input" ] && rootfs_input="/data/local/chroot/$distro"
-    TARGET="$rootfs_input"
-    url=$(ask_text "输入${distro} rootfs下载URL(arm64 tar包)")
-    if [ -z "$url" ]; then
-      echo "未提供URL，尝试使用Termux内置发行版源(proot-distro)下载: $distro" >&2
-      if bootstrap_rootfs_from_termux_source "$distro"; then
-        echo "已通过Termux内置源完成rootfs准备: $TARGET" >&2
-      else
-        echo "错误: 无URL且无法使用proot-distro内置源。请先执行 'pkg install proot-distro' 或提供rootfs URL。" >&2
-        exit 2
+  # 高级选项默认折叠
+  PERMISSIVE=1
+  RO_DATA=0
+  SAFE_MODE=0
+  FALLBACK_PROOT=0
+
+  # 运行模式：默认后台 sshd（可 SFTP/SSH）；可切换前台交互 shell
+  local run_mode_choice
+  run_mode_choice=$(choose_option "运行模式" \
+    "后台 sshd（推荐：可 SFTP/SSH）" \
+    "前台 shell（直接进入容器，退出即停）")
+  if [ "$run_mode_choice" = "后台 sshd（推荐：可 SFTP/SSH）" ]; then
+    DAEMON_MODE=1
+  else
+    DAEMON_MODE=0
+  fi
+
+  advanced=$(choose_option "高级选项" "保持默认（推荐）" "展开调整")
+  if [ "$advanced" = "展开调整" ]; then
+    advanced_choice=$(choose_option "SELinux" "permissive（推荐）" "保持当前")
+    [ "$advanced_choice" = "保持当前" ] && PERMISSIVE=0
+
+    advanced_choice=$(choose_option "/data 挂载" "读写（默认）" "只读")
+    [ "$advanced_choice" = "只读" ] && RO_DATA=1
+
+    advanced_choice=$(choose_option "失败时回退 proot?" "否（纯chroot，推荐）" "是（兼容）")
+    [ "$advanced_choice" = "是（兼容）" ] && FALLBACK_PROOT=1
+
+    local pwd_input
+    pwd_input=$(ask_text "root 密码（默认 123456，留空使用默认）")
+    [ -n "$pwd_input" ] && MCP_ROOT_PASSWORD="$pwd_input"
+
+    if [ "$AUTO_MIGRATE_IMAGE" -eq 1 ]; then
+      image_size_input=$(ask_text "镜像大小GB（默认20，留空使用默认）")
+      if [ -n "$image_size_input" ]; then
+        [[ "$image_size_input" =~ ^[0-9]+$ ]] && [ "$image_size_input" -gt 0 ] \
+          || { echo "错误: 必须是正整数GB" >&2; exit 2; }
+        IMAGE_SIZE_GB="$image_size_input"
       fi
-    else
-      echo "开始下载并解压rootfs到: $TARGET" >&2
-      download_rootfs_archive "$url" "$TARGET" || { echo "错误: rootfs下载/解压失败" >&2; exit 2; }
     fi
-
-    image_size_input=$(ask_text "输入镜像大小GB(留空默认20)")
-    if [ -n "$image_size_input" ]; then
-      if ! [[ "$image_size_input" =~ ^[0-9]+$ ]] || [ "$image_size_input" -le 0 ]; then
-        echo "错误: 镜像大小必须是正整数GB" >&2
-        exit 2
-      fi
-      IMAGE_SIZE_GB="$image_size_input"
-    fi
-    AUTO_MIGRATE_IMAGE=1
   fi
-
-  permissive_choice=$(choose_option "SELinux模式" "permissive(推荐)" "保持当前")
-  [ "$permissive_choice" = "permissive(推荐)" ] && PERMISSIVE=1
-
-  ro_choice=$(choose_option "/data挂载模式" "读写" "只读")
-  [ "$ro_choice" = "只读" ] && RO_DATA=1
-
-  fallback_choice=$(choose_option "chroot失败回退proot?" "否(纯原生chroot)" "是(兼容)")
-  [ "$fallback_choice" = "是(兼容)" ] && FALLBACK_PROOT=1 || FALLBACK_PROOT=0
 }
 
 if [ "$ORIG_ARGC" -eq 0 ]; then
@@ -1664,6 +2618,8 @@ if [ "$INTERACTIVE_MODE" -eq 1 ]; then
     [ -n "${DISTRO_NAME:-}" ] && ORIG_ARGS+=(--distro "$DISTRO_NAME")
     [ -n "${TARGET:-}" ] && ORIG_ARGS+=(--rootfs "$TARGET")
     [ -n "${IMAGE_SIZE_GB:-}" ] && ORIG_ARGS+=(--image-size-gb "$IMAGE_SIZE_GB")
+    [ -n "${SSHD_PORT_EXPLICIT:-}" ] && ORIG_ARGS+=(--sshd-port "$SSHD_PORT_EXPLICIT")
+    [ -n "${MCP_ROOT_PASSWORD:-}" ] && [ "${MCP_ROOT_PASSWORD}" != "123456" ] && ORIG_ARGS+=(--root-password "$MCP_ROOT_PASSWORD")
     [ "$RESIZE_IMAGE_MODE" -eq 1 ] && ORIG_ARGS+=(--resize-image)
     [ "$AUTO_MIGRATE_IMAGE" -eq 1 ] && ORIG_ARGS+=(--auto-migrate-image)
     [ "$PERMISSIVE" -eq 1 ] && ORIG_ARGS+=(--permissive)
@@ -1674,6 +2630,7 @@ if [ "$INTERACTIVE_MODE" -eq 1 ]; then
       ORIG_ARGS+=(--full-access)
     fi
     [ "$FALLBACK_PROOT" -eq 1 ] && ORIG_ARGS+=(--proot-fallback)
+    [ "$DAEMON_MODE" -eq 1 ] && ORIG_ARGS+=(--daemon)
     [ "$PRINT_INSTALL_GUIDE" -eq 1 ] && ORIG_ARGS+=(--print-install)
   fi
 else
@@ -1681,6 +2638,29 @@ else
 fi
 if [ "$STATUS_MODE" -eq 1 ]; then
   daemon_status
+  exit $?
+fi
+
+if [ "$EMERGENCY_SYNC_MODE" -eq 1 ]; then
+  emergency_sync_all
+  exit $?
+fi
+
+if [ "$SIZE_MODE" -eq 1 ]; then
+  show_all_container_sizes
+  exit 0
+fi
+
+if [ "$REMOVE_MODE" -eq 1 ]; then
+  if [ -z "${DISTRO_NAME:-}" ]; then
+    if [ -t 0 ] && [ -t 1 ]; then
+      DISTRO_NAME=$(choose_option "删除哪个发行版" ubuntu debian arch fedora alpine)
+    else
+      echo "错误: --remove 需要 --distro <名称> 或交互式 TTY" >&2
+      exit 2
+    fi
+  fi
+  remove_distro_assets "$DISTRO_NAME"
   exit $?
 fi
 
@@ -1776,7 +2756,24 @@ preflight_chroot() {
   local owner
   owner=$(stat -c "%u:%g" "$TARGET" 2>/dev/null || echo "unknown")
   [ "$owner" != "0:0" ] && echo_warn "rootfs目录属主不是root($owner)，可能导致chroot被拒绝"
-  [ ! -x "$TARGET/bin/bash" ] && echo_err "rootfs缺少可执行 /bin/bash，请检查你下载/解压的rootfs是否完整"
+  # alpine 等 busybox 发行版只有 /bin/sh（symlink → /bin/busybox），没有 bash。
+  # 注意：从宿主侧执行 -x 会跟随软链解析到宿主路径而误判，这里需要检查 rootfs
+  # 内部的真实文件（busybox 本体或非软链 sh）。
+  has_shell_in_rootfs() {
+    local p
+    for p in /bin/sh /usr/bin/sh /bin/bash /usr/bin/bash /bin/dash /usr/bin/dash /bin/ash /usr/bin/ash /bin/busybox /usr/bin/busybox /sbin/busybox; do
+      if [ -L "$TARGET$p" ] || [ -x "$TARGET$p" ]; then
+        return 0
+      fi
+    done
+    return 1
+  }
+  if ! has_shell_in_rootfs; then
+    echo_err "rootfs缺少可执行 /bin/sh 或 /bin/bash，请检查你下载/解压的rootfs是否完整"
+  fi
+  if [ ! -e "$TARGET/bin/bash" ] && [ ! -e "$TARGET/usr/bin/bash" ]; then
+    echo_warn "rootfs 没有 /bin/bash（典型 alpine/busybox 系），将退回到 /bin/sh"
+  fi
 
   # 仅检测 chroot syscall 能力，避免在完成大量挂载后才失败
   local preflight_err=""
@@ -1876,75 +2873,256 @@ EOF
 # ==============================================
 # sshd 准备 / chroot 执行与诊断
 # ==============================================
-get_default_distro_sshd_port() {
-  case "$(get_rootfs_name)" in
-    ubuntu) echo "8023" ;;
-    debian) echo "8024" ;;
-    arch) echo "8025" ;;
-    fedora) echo "8026" ;;
-    alpine) echo "8027" ;;
-    *) echo "8023" ;;
-  esac
+_port_config_file() {
+  echo "$PORT_CONFIG_DIR/$(get_rootfs_name).port"
 }
 
-ensure_rootfs_sshd_port() {
-  local cfg="$TARGET/etc/ssh/sshd_config"
-  local current_port=""
-  local want_port=""
+_is_valid_port() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
 
-  [ -f "$cfg" ] || return 0
-  want_port="$(get_default_distro_sshd_port)"
-  current_port=$(awk '''
-    /^[[:space:]]*#/ {next}
-    tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}
-  ''' "$cfg" 2>/dev/null)
+_port_in_use() {
+  local port="$1"
+  [ -n "$port" ] || return 1
+  # ss / netstat 任一可用即可；Android toybox netstat 没 -p 也能 grep
+  if command -v ss >/dev/null 2>&1; then
+    ss -tln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}\$" -q && return 0
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    netstat -tln 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}\$" -q && return 0
+  fi
+  # 兜底: bash /dev/tcp 探测
+  if (echo > "/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
 
-  if [ -z "$current_port" ] || [ "$current_port" = "22" ]; then
-    cp -an "$cfg" "${cfg}.mcp.bak" 2>/dev/null || true
-    if grep -qiE '^[[:space:]]*Port[[:space:]]+[0-9]+' "$cfg"; then
-      sed -i -E "0,/^[[:space:]]*Port[[:space:]]+[0-9]+/s//Port ${want_port}/" "$cfg" 2>/dev/null || true
+# 端口分配优先级:
+#   1. 命令行 --sshd-port=N 指定
+#   2. 持久化文件 $PORT_CONFIG_DIR/<distro>.port 中保存的端口（如未冲突直接复用）
+#   3. 发行版默认端口（如未冲突）
+#   4. 8023..8079 顺序扫
+#   5. 49152..65000 内随机三次
+# get_default_distro_sshd_port 已在文件顶部定义
+
+resolve_sshd_port() {
+  local distro_default=""
+  local saved=""
+  local explicit="${SSHD_PORT_EXPLICIT:-}"
+  local pcfg
+  pcfg="$(_port_config_file)"
+
+  if _is_valid_port "$explicit"; then
+    if _port_in_use "$explicit"; then
+      echo_warn "指定端口 $explicit 已被占用，将自动选择空闲端口"
     else
-      printf '
-# added by chroot-mcp-safe
-Port %s
-' "$want_port" >> "$cfg"
+      echo "$explicit"
+      return 0
     fi
-    echo_info "已将 rootfs sshd 端口规范为: $want_port ($(get_rootfs_name))"
+  fi
+
+  if [ -f "$pcfg" ]; then
+    saved=$(awk 'NR==1{print $1}' "$pcfg" 2>/dev/null)
+    if _is_valid_port "$saved" && ! _port_in_use "$saved"; then
+      echo "$saved"
+      return 0
+    fi
+  fi
+
+  distro_default="$(get_default_distro_sshd_port)"
+  if _is_valid_port "$distro_default" && ! _port_in_use "$distro_default"; then
+    echo "$distro_default"
+    return 0
+  fi
+
+  local p
+  for p in $(seq 8023 8079); do
+    _port_in_use "$p" || { echo "$p"; return 0; }
+  done
+
+  local i rnd
+  i=0
+  while [ "$i" -lt 12 ]; do
+    rnd=$(( 49152 + RANDOM % 15848 ))
+    if ! _port_in_use "$rnd"; then
+      echo "$rnd"
+      return 0
+    fi
+    i=$((i+1))
+  done
+
+  echo_err "无法找到可用 sshd 端口"
+}
+
+persist_sshd_port() {
+  local port="$1"
+  local pcfg
+  pcfg="$(_port_config_file)"
+  _is_valid_port "$port" || return 1
+  echo "$port" > "$pcfg" 2>/dev/null || true
+}
+
+_mcp_drop_in_path() {
+  echo "$TARGET/etc/ssh/sshd_config.d/99-mcp.conf"
+}
+
+_mcp_main_includes_dropin_dir() {
+  local cfg="$TARGET/etc/ssh/sshd_config"
+  [ -f "$cfg" ] || return 1
+  awk '
+    /^[[:space:]]*#/ {next}
+    tolower($1)=="include" {
+      for (i=2; i<=NF; i++) if ($i ~ /sshd_config\.d/) { found=1; exit }
+    }
+    END { exit (found?0:1) }
+  ' "$cfg"
+}
+
+ensure_rootfs_sshd_dropin() {
+  local cfg="$TARGET/etc/ssh/sshd_config"
+  local drop_dir="$TARGET/etc/ssh/sshd_config.d"
+  local drop="$(_mcp_drop_in_path)"
+  local want_port
+
+  want_port="$(resolve_sshd_port)"
+  [ -n "$want_port" ] || echo_err "端口分配失败"
+  ROOTFS_SSHD_PORT="$want_port"
+  persist_sshd_port "$want_port"
+
+  mkdir -p "$TARGET/etc/ssh" "$drop_dir" 2>/dev/null || true
+
+  # 部分发行版（Debian 12+ 等）apt 安装 openssh-server 时 dpkg 留下样例
+  # /usr/share/openssh/sshd_config，但不会自动放到 /etc/ssh。这里兜底拷贝。
+  if [ ! -f "$cfg" ]; then
+    local sample
+    for sample in \
+      "$TARGET/usr/share/openssh/sshd_config" \
+      "$TARGET/etc/ssh/sshd_config.dpkg-dist" \
+      "$TARGET/usr/share/doc/openssh-server/examples/sshd_config"; do
+      if [ -f "$sample" ]; then
+        cp -a "$sample" "$cfg" && {
+          echo_info "已从样例还原 sshd_config: $sample"
+          break
+        }
+      fi
+    done
+  fi
+  if [ ! -f "$cfg" ]; then
+    cat > "$cfg" <<'EOF'
+# Generated by chroot-mcp-safe (rootfs has no sshd_config sample)
+Include /etc/ssh/sshd_config.d/*.conf
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+EOF
+    chmod 644 "$cfg" 2>/dev/null || true
+    echo_warn "rootfs 缺失 sshd_config，已写入最小可用配置"
+  fi
+
+  # 一次性把脏的主配置里的 BEGIN/END 块移除（历史遗留），不再回写
+  if grep -q '^# BEGIN chroot-mcp-safe sshd$' "$cfg" 2>/dev/null; then
+    cp -an "$cfg" "${cfg}.mcp.bak" 2>/dev/null || true
+    local tmp
+    tmp=$(mktemp "$STATE_DIR/sshd_config.XXXXXX") || return 1
+    sed '/^# BEGIN chroot-mcp-safe sshd$/,/^# END chroot-mcp-safe sshd$/d' "$cfg" > "$tmp"
+    cat "$tmp" > "$cfg"
+    rm -f "$tmp" 2>/dev/null || true
+    echo_info "已从主 sshd_config 移除历史 BEGIN/END 块（迁移到 drop-in）"
+  fi
+
+  # 写入 drop-in 文件（每次启动幂等覆盖，主配置文件保持不动）
+  # 注意：Subsystem sftp 已在主配置中定义（debian/ubuntu 默认即有），
+  # drop-in 里再写一行会被 sshd 拒绝："Subsystem 'sftp' already defined"。
+  cat > "$drop" <<EOF
+# Generated by chroot-mcp-safe (do not edit; will be overwritten)
+Port ${want_port}
+PermitRootLogin yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+EOF
+  chmod 644 "$drop" 2>/dev/null || true
+
+  # 检查主配置是否已定义 sftp Subsystem；若无则补一行（确保 SFTP 可用）
+  if ! grep -qE '^[[:space:]]*Subsystem[[:space:]]+sftp\b' "$cfg" 2>/dev/null; then
+    printf '\nSubsystem sftp internal-sftp\n' >> "$cfg"
+    echo_info "主 sshd_config 缺少 Subsystem sftp，已追加 internal-sftp"
+  fi
+  echo_info "已写入 sshd drop-in: /etc/ssh/sshd_config.d/99-mcp.conf (Port ${want_port})"
+
+  # 主配置如果没 Include 习惯（极少见的发行版），追加一行 Include 而不是覆盖
+  if ! _mcp_main_includes_dropin_dir; then
+    cp -an "$cfg" "${cfg}.mcp.bak" 2>/dev/null || true
+    if ! grep -q '^# chroot-mcp-safe: include drop-in$' "$cfg" 2>/dev/null; then
+      printf '\n# chroot-mcp-safe: include drop-in\nInclude /etc/ssh/sshd_config.d/*.conf\n' >> "$cfg"
+      echo_info "已为 sshd_config 追加 Include /etc/ssh/sshd_config.d/*.conf"
+    fi
   fi
 }
 
-ensure_rootfs_sshd_access() {
-  local cfg="$TARGET/etc/ssh/sshd_config"
-  local tmp=""
+# 兼容旧调用名：现在两个旧函数都收敛到 drop-in 写入
+ensure_rootfs_sshd_port()   { ensure_rootfs_sshd_dropin; }
+ensure_rootfs_sshd_access() { ensure_rootfs_sshd_dropin; }
 
-  [ -f "$cfg" ] || return 0
-  cp -an "$cfg" "${cfg}.mcp.bak" 2>/dev/null || true
+# 设置 root 密码为预约定值（默认 123456，可由 MCP_ROOT_PASSWORD 环境变量覆盖）
+ensure_rootfs_root_password() {
+  local password="${MCP_ROOT_PASSWORD:-123456}"
+  local marker_dir="$TARGET/var/lib/chroot-mcp"
+  local marker="$marker_dir/root-password-set"
 
-  tmp=$(mktemp "/data/data/com.termux/files/usr/tmp/sshd_config.XXXXXX") || return 1
-  {
-    printf '%s\n' '# BEGIN chroot-mcp-safe sshd'
-    printf '%s\n' 'PermitRootLogin yes'
-    printf '%s\n' 'PasswordAuthentication yes'
-    printf '%s\n' 'KbdInteractiveAuthentication yes'
-    printf '%s\n' 'Subsystem sftp internal-sftp'
-    printf '%s\n\n' '# END chroot-mcp-safe sshd'
-    sed '/^# BEGIN chroot-mcp-safe sshd$/,/^# END chroot-mcp-safe sshd$/d' "$cfg"
-  } > "$tmp"
+  mkdir -p "$marker_dir" 2>/dev/null || true
+  if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$password" ]; then
+    return 0
+  fi
 
-  cat "$tmp" > "$cfg"
-  rm -f "$tmp" 2>/dev/null || true
-  echo_info '已规范 rootfs sshd 登录/SFTP 配置'
+  # 通过 chroot 内执行 chpasswd / busybox passwd 设定密码
+  local shell_path
+  shell_path="$(get_rootfs_chroot_shell)"
+  local set_cmd="
+    if command -v chpasswd >/dev/null 2>&1; then
+      printf 'root:%s\n' '$password' | chpasswd
+    elif command -v busybox >/dev/null 2>&1 && busybox passwd 2>&1 | head -1 | grep -qi password; then
+      printf '%s\n%s\n' '$password' '$password' | busybox passwd root
+    elif command -v passwd >/dev/null 2>&1; then
+      printf '%s\n%s\n' '$password' '$password' | passwd root 2>/dev/null
+    else
+      echo no_chpasswd
+      exit 12
+    fi
+  "
+  if HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c "$set_cmd" >/dev/null 2>&1; then
+    printf '%s' "$password" > "$marker" 2>/dev/null || true
+    chmod 600 "$marker" 2>/dev/null || true
+    echo_info "已设定 root 密码 (用户名: root, 密码: ${password})"
+  else
+    echo_warn "root 密码设置失败（rootfs 可能缺 chpasswd/passwd），可手动 chroot 后执行 'echo root:${password} | chpasswd'"
+  fi
 }
 
 get_rootfs_sshd_port() {
   local cfg="$TARGET/etc/ssh/sshd_config"
-  if [ -f "$cfg" ]; then
-    awk '
+  local drop="$(_mcp_drop_in_path)"
+  local port=""
+
+  if [ -f "$drop" ]; then
+    port=$(awk '
       /^[[:space:]]*#/ {next}
       tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}
-    ' "$cfg" 2>/dev/null
-    return 0
+    ' "$drop" 2>/dev/null)
   fi
+
+  if [ -z "$port" ] && [ -f "$cfg" ]; then
+    port=$(awk '
+      /^[[:space:]]*#/ {next}
+      tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2; exit}
+    ' "$cfg" 2>/dev/null)
+  fi
+
+  [ -n "$port" ] && { echo "$port"; return 0; }
   echo "22"
 }
 
@@ -1960,19 +3138,38 @@ log_diag_block() {
 }
 
 resolve_rootfs_exec_path() {
-  local cand host resolved
+  # 在宿主侧判断 rootfs 内某可执行是否可用。难点：
+  # 1) 直接 readlink -f 会把 rootfs 里的绝对软链解析到宿主绝对路径（错的）
+  # 2) [ -x "$TARGET/bin/sh" ] 会跟随软链到宿主，对 busybox/alpine 永远失败
+  # 思路：手工解析符号链接，限定在 $TARGET 内迭代，最多 16 步
+  local cand host link target_path target_inside steps
   for cand in "$@"; do
     host="$TARGET$cand"
-    if [ -e "$host" ] || [ -L "$host" ]; then
-      resolved=$(readlink -f "$host" 2>/dev/null || true)
-      if [ -n "$resolved" ] && [ "${resolved#\"$TARGET\"}" != "$resolved" ] && [ -x "$resolved" ]; then
-        echo "${resolved#$TARGET}"
-        return 0
+    target_path="$cand"
+    steps=0
+    while :; do
+      target_inside="$TARGET$target_path"
+      if [ -L "$target_inside" ]; then
+        link=$(readlink "$target_inside" 2>/dev/null)
+        [ -z "$link" ] && break
+        case "$link" in
+          /*) target_path="$link" ;;
+          *) target_path="$(dirname "$target_path")/$link" ;;
+        esac
+        steps=$((steps + 1))
+        [ "$steps" -ge 16 ] && break
+        continue
       fi
-      if [ -x "$host" ]; then
+      if [ -f "$target_inside" ] && [ -x "$target_inside" ]; then
         echo "$cand"
         return 0
       fi
+      break
+    done
+    # 若解析失败，再尝试直接 -x（极少情况下挂载层 fallthrough 是有效的）
+    if [ -f "$host" ] && [ -x "$host" ]; then
+      echo "$cand"
+      return 0
     fi
   done
   return 1
@@ -1996,7 +3193,7 @@ get_rootfs_chroot_shell() {
 chroot_cmd_capture() {
   local shell_path="$1"
   local cmd="$2"
-  HOME=/root PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c "$cmd" 2>&1
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c "$cmd" 2>&1
 }
 
 chroot_pid_alive_retry() {
@@ -2081,6 +3278,75 @@ run_chroot_cmd_retry() {
   return "${rc:-1}"
 }
 
+# 自动安装 openssh-server（在容器内）。返回 0 表示装好或已装；非 0 表示放弃。
+ensure_rootfs_sshd_installed() {
+  local cand
+  for cand in /usr/sbin/sshd /usr/bin/sshd /sbin/sshd /bin/sshd; do
+    [ -x "$TARGET$cand" ] && return 0
+  done
+
+  echo_info "rootfs 未发现 sshd，尝试在容器内自动安装 openssh-server..."
+
+  local shell_path
+  shell_path="$(get_rootfs_chroot_shell)"
+
+  # DNS 自检（resolv.conf 在外层已修好；这里只验证 + 列日志）
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c '
+    echo "[probe] /etc/resolv.conf:"
+    ls -la /etc/resolv.conf 2>&1 || true
+    echo "[probe] resolv.conf content head:"
+    head -5 /etc/resolv.conf 2>&1 || true
+    if getent hosts deb.debian.org >/dev/null 2>&1 \
+       || getent hosts archive.ubuntu.com >/dev/null 2>&1 \
+       || getent hosts mirrors.tuna.tsinghua.edu.cn >/dev/null 2>&1; then
+      echo "[probe] DNS OK"
+    else
+      echo "[probe] DNS FAIL: 上游解析失败"
+    fi
+  ' 2>&1 | log_diag_block "ensure_rootfs_sshd_installed:dns" || true
+
+  local install_cmd=""
+  # 强制在容器内使用 /tmp 作为临时目录，规避宿主 TMPDIR 残留（例如 MT 终端的
+  # /data/user/0/bin.mt.plus/files/term/tmp，进 chroot 后路径不存在导致 mkstemp 失败）
+  local tmp_prelude='mkdir -p /tmp /var/tmp 2>/dev/null || true
+                     chmod 1777 /tmp /var/tmp 2>/dev/null || true
+                     export TMPDIR=/tmp TMP=/tmp TEMP=/tmp'
+
+  if [ -x "$TARGET/usr/bin/apt-get" ] || [ -x "$TARGET/usr/bin/apt" ]; then
+    install_cmd="$tmp_prelude
+                 export DEBIAN_FRONTEND=noninteractive
+                 apt-get update -y || true
+                 apt-get install -y --no-install-recommends openssh-server openssh-sftp-server"
+  elif [ -x "$TARGET/usr/bin/dnf" ]; then
+    install_cmd="$tmp_prelude
+                 dnf install -y openssh-server openssh-clients"
+  elif [ -x "$TARGET/usr/bin/yum" ]; then
+    install_cmd="$tmp_prelude
+                 yum install -y openssh-server openssh-clients"
+  elif [ -x "$TARGET/usr/bin/pacman" ] || [ -x "$TARGET/sbin/pacman" ]; then
+    install_cmd="$tmp_prelude
+                 pacman -Sy --noconfirm openssh"
+  elif [ -x "$TARGET/sbin/apk" ] || [ -x "$TARGET/usr/sbin/apk" ] || [ -x "$TARGET/bin/apk" ]; then
+    install_cmd="$tmp_prelude
+                 apk update >/dev/null 2>&1 || true
+                 apk add --no-cache openssh openssh-sftp-server"
+  else
+    echo_warn "未识别 rootfs 包管理器，请手动安装 openssh-server 后再重启容器"
+    return 1
+  fi
+
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c "$install_cmd" 2>&1 | log_diag_block "ensure_rootfs_sshd_installed" || true
+
+  for cand in /usr/sbin/sshd /usr/bin/sshd /sbin/sshd /bin/sshd; do
+    [ -x "$TARGET$cand" ] && { echo_info "openssh-server 安装完成: $cand"; return 0; }
+  done
+  echo_warn "openssh-server 安装失败，请检查容器内网络/源"
+  echo_warn "  常见原因: (1) /etc/resolv.conf 是 dangling symlink → 已自动修复"
+  echo_warn "           (2) 容器源被墙 → 进容器后改用国内镜像"
+  echo_warn "           (3) 宿主网络断 → 检查手机是否联网"
+  return 1
+}
+
 prepare_and_start_sshd() {
   local sshd_bin=""
   local cand
@@ -2103,11 +3369,20 @@ prepare_and_start_sshd() {
     fi
   done
 
+  if [ -z "$sshd_bin" ]; then
+    if ensure_rootfs_sshd_installed; then
+      for cand in /usr/sbin/sshd /usr/bin/sshd /sbin/sshd /bin/sshd; do
+        if [ -x "$TARGET$cand" ]; then
+          sshd_bin="$cand"
+          break
+        fi
+      done
+    fi
+  fi
   [ -z "$sshd_bin" ] && return 0
   SSHD_PRESENT=1
 
-  ensure_rootfs_sshd_port
-  ensure_rootfs_sshd_access
+  ensure_rootfs_sshd_dropin
 
   mkdir -p "$TARGET/run/sshd" 2>/dev/null || true
   chmod 755 "$TARGET/run/sshd" 2>/dev/null || true
@@ -2115,7 +3390,7 @@ prepare_and_start_sshd() {
   shell_path="$(get_rootfs_chroot_shell)"
   echo_info "sshd启动将使用 chroot shell: $shell_path"
 
-  direct_probe_out="$(HOME=/root PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c 'true' 2>&1)"
+  direct_probe_out="$(HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c 'true' 2>&1)"
   if [ $? -eq 0 ]; then
     echo_info "prepare_and_start_sshd直连chroot探测成功 (shell=$shell_path)"
   else
@@ -2128,6 +3403,30 @@ prepare_and_start_sshd() {
     echo_err "chroot入口预热失败，最近输出: $(printf '%s' "$CHROOT_LAST_OUTPUT" | tr '
 ' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
   }
+
+  ensure_rootfs_root_password
+
+  # 创建 sshd 特权分离用户（UsePrivilegeSeparation 默认开，缺这个用户会拒启）
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$shell_path" -c '
+    set -e
+    if ! getent passwd sshd >/dev/null 2>&1; then
+      mkdir -p /var/run/sshd /run/sshd 2>/dev/null || true
+      if command -v useradd >/dev/null 2>&1; then
+        groupadd -r sshd 2>/dev/null || true
+        useradd -r -g sshd -d /run/sshd -s /usr/sbin/nologin sshd 2>/dev/null \
+          || useradd -r -g sshd -d /run/sshd -s /bin/false sshd 2>/dev/null || true
+      elif command -v adduser >/dev/null 2>&1; then
+        # busybox/alpine variant
+        addgroup -S sshd 2>/dev/null || true
+        adduser -S -D -H -h /run/sshd -s /sbin/nologin -G sshd sshd 2>/dev/null || true
+      else
+        # 兜底：直接追加 /etc/passwd /etc/group
+        getent group sshd >/dev/null 2>&1 || echo "sshd:x:74:" >> /etc/group
+        echo "sshd:x:74:74:Privilege-separated SSH:/run/sshd:/usr/sbin/nologin" >> /etc/passwd
+      fi
+      echo "[sshd-user] created"
+    fi
+  ' 2>&1 | log_diag_block "ensure_sshd_user" || true
 
   run_chroot_cmd_retry "sshd配置预检" "mkdir -p /run/sshd && chmod 755 /run/sshd && if command -v ssh-keygen >/dev/null 2>&1; then ssh-keygen -A >/dev/null 2>&1 || true; fi && $sshd_bin -t" 5 1 1
   if [ $? -ne 0 ]; then
@@ -2223,6 +3522,10 @@ do_mount() {
   elif [ "$type" = "rbind" ]; then
     mount --rbind "$src" "$dst" || echo_err "rbind挂载失败: $src -> $dst"
 
+    # rbind 关键安全步：把整棵子树设为 rprivate，断开与宿主的传播
+    # 这样容器内对子挂载点的任何后续操作都不会反向影响宿主分区
+    mount --make-rprivate "$dst" 2>/dev/null || mount --make-private "$dst" 2>/dev/null || true
+
     if [ -n "$opt" ]; then
       mount -o "remount,bind,$opt" "$dst" || {
         echo_warn "remount失败，回退只读: $dst"
@@ -2269,7 +3572,7 @@ kill_pid_tree() {
 quick_lazy_umount() {
   local mp="$1"
   case "$mp" in
-    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex")
+    "$TARGET/storage/emulated/0"|"$TARGET/sdcard"|"$TARGET/apex"|"$TARGET/data"|"$TARGET/data_mirror"|"$TARGET/mnt"|"$TARGET/dev")
       umount -l "$mp" 2>/dev/null || umount "$mp" 2>/dev/null || true
       ;;
     *)
@@ -2326,7 +3629,7 @@ cleanup() {
     if is_mounted "$TARGET"; then
       quick_lazy_umount "$TARGET"
     fi
-    [ -n "$IMAGE_LOOPDEV" ] && /data/data/com.termux/files/usr/bin/losetup -d "$IMAGE_LOOPDEV" 2>/dev/null || true
+    [ -n "$IMAGE_LOOPDEV" ] && "$LOSETUP_BIN" -d "$IMAGE_LOOPDEV" 2>/dev/null || true
     cleanup_stale_loop_devices_for_image "$IMAGE_FILE" "$IMAGE_MOUNTPOINT"
   fi
 
@@ -2356,7 +3659,7 @@ if [ -z "${_ISOLATED_NAMESPACE:-}" ]; then
   if unshare --help 2>&1 | grep -q -- "--propagation"; then
     exec unshare --mount --propagation private env LOG_FILE="$LOG_FILE" _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
   fi
-  exec unshare -m env LOG_FILE="$LOG_FILE" _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
+  exec "$UNSHARE_BIN" -m env LOG_FILE="$LOG_FILE" _ISOLATED_NAMESPACE=1 "$0" "${ORIG_ARGS[@]}"
 fi
 trap cleanup EXIT SIGINT SIGTERM SIGHUP QUIT
 
@@ -2372,7 +3675,7 @@ fi
 
 
 nested_target_mounts=0
-if grep -Fq " $TARGET/proc " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/dev " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/system " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/android_root " /proc/self/mountinfo 2>/dev/null; then
+if grep -Fq " $TARGET/proc " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/dev " /proc/self/mountinfo 2>/dev/null    || grep -Fq " $TARGET/system " /proc/self/mountinfo 2>/dev/null; then
   nested_target_mounts=1
 fi
 
@@ -2399,16 +3702,22 @@ echo_info "已锁定根目录传播属性为private"
 echo_info "开始构建MCP专属Chroot环境..."
 
 do_mount "proc" "$TARGET/proc" "proc" "nosuid,noexec,nodev"
-do_mount "sysfs" "$TARGET/sys" "sysfs" "nosuid,noexec,nodev,ro"
+# sysfs 改 rw 是为了让容器内能 mkdir 子挂载点（debugfs/tracefs）
+# sysfs 节点本身的写权限受内核保护，rw 挂载并不会让 agent 能改内核状态
+do_mount "sysfs" "$TARGET/sys" "sysfs" "nosuid,noexec,nodev"
 
-do_mount "/dev" "$TARGET/dev" "bind" "nosuid,noexec"
+# /dev 用 rbind 一并拿到 /dev/binderfs, /dev/pts 等子挂载，避免单独挂载叠加
+# 注意: nosuid 保留(防 setuid 攻击)，noexec 必须去掉，否则 /dev/ashmem 等设备
+# 工具(stackplz/frida 注入)无法运行
+do_mount "/dev" "$TARGET/dev" "rbind" "nosuid"
 mkdir -p "$TARGET/dev/pts"
 chmod 1777 "$TARGET/dev/shm" 2>/dev/null || true
+# 容器自己的 devpts 实例(newinstance + ptmxmode)，避免与宿主 pts 冲突
 do_mount "devpts" "$TARGET/dev/pts" "devpts" "nosuid,noexec,newinstance,ptmxmode=0666"
 
-# 添加 binderfs 以支持 Binder IPC（am/pm/settings 等 Android 命令需要）
-if [ -d "/dev/binderfs" ]; then
-  mkdir -p "$TARGET/dev/binderfs"
+# binderfs 已通过 rbind 自动进来，此处仅兜底兼容旧路径(若 rbind 漏挂)
+if [ -d "/dev/binderfs" ] && ! grep -Fq " $TARGET/dev/binderfs " /proc/self/mountinfo 2>/dev/null; then
+  mkdir -p "$TARGET/dev/binderfs" 2>/dev/null || true
   do_mount "/dev/binderfs" "$TARGET/dev/binderfs" "bind" "rw"
 fi
 
@@ -2420,32 +3729,10 @@ do_mount "tmpfs" "$TARGET/dev/shm" "tmpfs" "nosuid,nodev,size=100M,mode=1777"
 # /data 兼容映射整理
 # ==============================================
 normalize_direct_android_mountpoints() {
-  if [[ "$TARGET" == /data/* ]] && [ "$IMAGE_MODE" -eq 0 ]; then
-    return 0
-  fi
-
-  if [ -L "$TARGET/android_data" ]; then
-    case "$(readlink "$TARGET/android_data" 2>/dev/null || true)" in
-      android_root/data|/android_root/data|android_data|/android_data)
-        rm -f "$TARGET/android_data" 2>/dev/null || echo_err "无法移除遗留 android_data 符号链接"
-        mkdir -p "$TARGET/android_data" 2>/dev/null || echo_err "无法创建目录挂载点: $TARGET/android_data"
-        chown 0:0 "$TARGET/android_data" 2>/dev/null || true
-        chmod 755 "$TARGET/android_data" 2>/dev/null || true
-        echo_info "已将遗留 android_data 符号链接修正为目录挂载点"
-        ;;
-      *)
-        echo_warn "检测到非标准 android_data 符号链接，保留原状: $(readlink "$TARGET/android_data" 2>/dev/null || true)"
-        ;;
-    esac
-  elif [ ! -e "$TARGET/android_data" ]; then
-    mkdir -p "$TARGET/android_data" 2>/dev/null || echo_err "无法创建目录挂载点: $TARGET/android_data"
-    chown 0:0 "$TARGET/android_data" 2>/dev/null || true
-    chmod 755 "$TARGET/android_data" 2>/dev/null || true
-  fi
-
+  # 仅确保 /data 作为目录存在；不再创建任何 android_* 别名挂载点。
   if [ -L "$TARGET/data" ]; then
     case "$(readlink "$TARGET/data" 2>/dev/null || true)" in
-      android_data|/android_data)
+      android_data|/android_data|android_root/data|/android_root/data)
         rm -f "$TARGET/data" 2>/dev/null || echo_err "无法移除遗留 data 符号链接"
         mkdir -p "$TARGET/data" 2>/dev/null || echo_err "无法创建目录挂载点: $TARGET/data"
         chown 0:0 "$TARGET/data" 2>/dev/null || true
@@ -2461,6 +3748,19 @@ normalize_direct_android_mountpoints() {
     chown 0:0 "$TARGET/data" 2>/dev/null || true
     chmod 755 "$TARGET/data" 2>/dev/null || true
   fi
+
+  # 清理任何遗留的 android_* 链接/空目录，避免对 AI agent 造成干扰
+  local stale
+  for stale in android_root android_data android_system android_vendor \
+               android_product android_odm android_boot android_system_ext \
+               android_apex android_metadata; do
+    [ -e "$TARGET/$stale" ] || [ -L "$TARGET/$stale" ] || continue
+    if [ -L "$TARGET/$stale" ]; then
+      rm -f "$TARGET/$stale" 2>/dev/null || true
+    elif [ -d "$TARGET/$stale" ] && [ -z "$(ls -A "$TARGET/$stale" 2>/dev/null)" ]; then
+      rmdir "$TARGET/$stale" 2>/dev/null || true
+    fi
+  done
 }
 
 prepare_data_mapping() {
@@ -2476,44 +3776,24 @@ prepare_data_mapping() {
     echo_warn "⚠️ 已启用/data只读模式"
   fi
 
-  if [[ "$TARGET" == /data/* ]] && [ "$DATA_MOUNT_OPT" = "ro" ]; then
-    rm -rf "$TARGET/android_data" 2>/dev/null || true
-    ln -snf android_root/data "$TARGET/android_data"
-    rm -rf "$TARGET/data" 2>/dev/null || true
-    ln -snf android_data "$TARGET/data"
-    echo_warn "为避免 rootfs 位于 /data 下导致的递归自绑定风险，安全模式下 /data 与 /android_data 已只读映射到 /android_root/data"
-    return 0
-  fi
-
-  do_mount "/data" "$TARGET/android_data" "bind" "$DATA_MOUNT_OPT"
-
-  if [[ "$TARGET" == /data/* ]]; then
-    if [ -L "$TARGET/data" ] || [ ! -e "$TARGET/data" ]; then
-      rm -f "$TARGET/data" 2>/dev/null || true
-      ln -snf android_data "$TARGET/data"
-    elif [ -d "$TARGET/data" ]; then
-      if [ -z "$(ls -A "$TARGET/data" 2>/dev/null)" ]; then
-        rmdir "$TARGET/data" 2>/dev/null || true
-        ln -snf android_data "$TARGET/data"
-      elif [ ! -e "$TARGET/.rootfs_data" ]; then
-        mv "$TARGET/data" "$TARGET/.rootfs_data" 2>/dev/null || true
-        ln -snf android_data "$TARGET/data"
-      else
-        echo_warn "rootfs 原始 /data 已保留在 /.rootfs_data；当前 /data 使用安全等效映射 -> /android_data"
-        rm -rf "$TARGET/data" 2>/dev/null || true
-        ln -snf android_data "$TARGET/data"
-      fi
-    else
-      rm -f "$TARGET/data" 2>/dev/null || true
-      ln -snf android_data "$TARGET/data"
+  # rootfs 位于宿主 /data 之下时，bind /data → $TARGET/data 会出现自递归。
+  # 这种情况下先把宿主原始 /data 内容保留在 /.rootfs_data，再做 bind。
+  if [[ "$TARGET" == /data/* ]] && [ "$IMAGE_MODE" -eq 0 ]; then
+    if [ -d "$TARGET/data" ] && [ -n "$(ls -A "$TARGET/data" 2>/dev/null)" ] \
+       && [ ! -e "$TARGET/.rootfs_data" ]; then
+      mv "$TARGET/data" "$TARGET/.rootfs_data" 2>/dev/null || true
+      mkdir -p "$TARGET/data" 2>/dev/null || true
+      echo_warn "rootfs 原始 /data 已保留为 /.rootfs_data，避免递归自绑定"
     fi
-    echo_warn "为避免 rootfs 位于 /data 下导致的递归自绑定风险，chroot 内 /data 已安全等效映射到 /android_data"
-  else
-    do_mount "/data" "$TARGET/data" "bind" "$DATA_MOUNT_OPT"
   fi
+
+  # 关键改动: bind -> rbind，让宿主 /data 下的子挂载（如 /data/user/0
+  # 这种 Android 多用户 bind mount，以及未来任何其它 sub-mount）一并
+  # 进入容器。配合 do_mount 中的 make-rprivate，子挂载与宿主隔离传播，
+  # 容器异常退出时 namespace 自动 GC，不会污染宿主分区。
+  do_mount "/data" "$TARGET/data" "rbind" "$DATA_MOUNT_OPT"
 }
 
-do_mount "/" "$TARGET/android_root" "bind" "$HOST_ROOT_OPT"
 normalize_direct_android_mountpoints
 
 prepare_data_mapping
@@ -2522,20 +3802,14 @@ REAL_SYSTEM=$(resolve_mount_path "/system")
 REAL_VENDOR=$(resolve_mount_path "/vendor")
 REAL_PRODUCT=$(resolve_mount_path "/product")
 REAL_ODM=$(resolve_mount_path "/odm")
-REAL_BOOT=$(resolve_mount_path "/boot")
 REAL_SYSTEM_EXT=$(resolve_mount_path "/system_ext")
 REAL_APEX=$(resolve_mount_path "/apex")
 REAL_METADATA=$(resolve_mount_path "/metadata")
 
 do_mount "$REAL_SYSTEM" "$TARGET/system" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_SYSTEM" "$TARGET/android_system" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_VENDOR" "$TARGET/vendor" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_VENDOR" "$TARGET/android_vendor" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_PRODUCT" "$TARGET/product" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_PRODUCT" "$TARGET/android_product" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_ODM" "$TARGET/odm" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_ODM" "$TARGET/android_odm" "bind" "$SYS_MOUNT_OPT"
-do_mount "$REAL_BOOT" "$TARGET/android_boot" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_SYSTEM_EXT" "$TARGET/system_ext" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_APEX" "$TARGET/apex" "rbind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_METADATA" "$TARGET/metadata" "bind" "$SYS_MOUNT_OPT"
@@ -2546,22 +3820,100 @@ if [ -d "/linkerconfig" ]; then
 fi
 
 if [ -d "/storage/emulated/0" ]; then
-  do_mount "/storage/emulated/0" "$TARGET/storage/emulated/0" "bind" "$SDCARD_MOUNT_OPT"
-  do_mount "/storage/emulated/0" "$TARGET/sdcard" "bind" "$SDCARD_MOUNT_OPT"
+  # rbind 拿到 Android/data, Android/obb 等子挂载（Android 11+ 多挂载点视图）
+  do_mount "/storage/emulated/0" "$TARGET/storage/emulated/0" "rbind" "$SDCARD_MOUNT_OPT"
+  do_mount "/storage/emulated/0" "$TARGET/sdcard" "rbind" "$SDCARD_MOUNT_OPT"
 fi
 
-if [ -s "/etc/resolv.conf" ]; then
-  do_mount "/etc/resolv.conf" "$TARGET/etc/resolv.conf" "bind" "ro"
+# ==============================================
+# 多挂载点 Agent 增强区（v2.2 新增）
+# 目的: 让容器内 agent 能看到完整 Android 视图，支持调试/逆向
+# 安全: 全部 rbind/bind 在 namespace 内，已 make-rprivate 隔离传播
+# ==============================================
+
+# /data_mirror: Android 11+ 多用户镜像视图（FBE 加密分层）
+# 包含 data_ce/data_de/misc_ce/misc_de/storage_area 等子挂载
+if [ -d "/data_mirror" ]; then
+  do_mount "/data_mirror" "$TARGET/data_mirror" "rbind" "$DATA_MOUNT_OPT"
 fi
+
+# /mnt: 多用户存储视图根目录
+# 包含 /mnt/user/0, /mnt/pass_through/0, /mnt/installer/0, /mnt/androidwritable/0
+if [ -d "/mnt" ]; then
+  do_mount "/mnt" "$TARGET/mnt" "rbind" "$DATA_MOUNT_OPT"
+
+  # 关键变砖防护：把高危子挂载强制 remount 只读
+  # /mnt/vendor/persist: IMEI/序列号/校准数据，写入即变砖
+  # /mnt/vendor/qmcs:    高通 QMCS 指纹/认证数据
+  # 由于已经 make-rprivate，容器内 remount,ro 不会传到宿主，宿主功能不受影响
+  for _danger in /mnt/vendor/persist /mnt/vendor/qmcs; do
+    if grep -qE " $TARGET$_danger " /proc/self/mountinfo 2>/dev/null; then
+      mount -o remount,bind,ro "$TARGET$_danger" 2>/dev/null \
+        && echo_info "🛡 已强制只读: $_danger（变砖防护）" \
+        || echo_warn "⚠ 无法只读 $_danger，请勿在容器内写入"
+    fi
+  done
+fi
+
+# /mi_ext: 小米厂商扩展（erofs ro，bind 进来仅供查看）
+if [ -d "/mi_ext" ]; then
+  do_mount "/mi_ext" "$TARGET/mi_ext" "bind" "ro"
+fi
+
+# /sys/kernel/debug: debugfs，BPF/kprobe/uprobe/ftrace 全靠它
+# /sys/kernel/tracing: tracefs，stackplz/perf/ftrace 直接读这个
+# mountinfo 第 5 字段才是挂载点；用 awk 精确匹配避免假阴/假阳
+_host_has_mount() {
+  awk -v p="$1" '$5==p {found=1; exit} END{exit !found}' /proc/self/mountinfo
+}
+
+if [ -d "/sys/kernel/debug" ] && _host_has_mount /sys/kernel/debug; then
+  do_mount "/sys/kernel/debug" "$TARGET/sys/kernel/debug" "bind" "rw"
+else
+  # 宿主未挂 debugfs，自己在容器内挂一份
+  if [ -d "/sys/kernel/debug" ]; then
+    mkdir -p "$TARGET/sys/kernel/debug" 2>/dev/null
+    do_mount "debugfs" "$TARGET/sys/kernel/debug" "debugfs" "rw,nosuid,nodev,noexec" || true
+  fi
+fi
+
+if [ -d "/sys/kernel/tracing" ] && _host_has_mount /sys/kernel/tracing; then
+  do_mount "/sys/kernel/tracing" "$TARGET/sys/kernel/tracing" "bind" "rw"
+else
+  if [ -d "/sys/kernel/tracing" ]; then
+    mkdir -p "$TARGET/sys/kernel/tracing" 2>/dev/null
+    do_mount "tracefs" "$TARGET/sys/kernel/tracing" "tracefs" "rw,nosuid,nodev,noexec" || true
+  fi
+fi
+
+# 修复 rootfs 内 /etc/resolv.conf：直接复制宿主 DNS 配置，不再 bind-mount。
+# 理由：
+#   1. resolv.conf 是静态文本，不需要随宿主变化实时同步；
+#   2. bind 单文件的 remount 在嵌套 loop / 多层挂载下可能 EBUSY；
+#   3. 容器内的发行版（如 debian）默认会把 /etc/resolv.conf 做成
+#      systemd-resolved 的 dangling symlink，bind 时跟随会指向不存在的目标。
+mkdir -p "$TARGET/etc" 2>/dev/null || true
+if [ -L "$TARGET/etc/resolv.conf" ]; then
+  rm -f "$TARGET/etc/resolv.conf" 2>/dev/null || true
+fi
+if [ -s "/etc/resolv.conf" ]; then
+  cp -f "/etc/resolv.conf" "$TARGET/etc/resolv.conf" 2>/dev/null \
+    || cat "/etc/resolv.conf" > "$TARGET/etc/resolv.conf" 2>/dev/null || true
+else
+  printf 'nameserver 223.5.5.5\nnameserver 1.1.1.1\nnameserver 8.8.8.8\noptions timeout:2 attempts:2\n' \
+    > "$TARGET/etc/resolv.conf"
+  echo_warn "宿主 /etc/resolv.conf 为空，已直接写入回退 DNS 到容器 /etc/resolv.conf"
+fi
+chmod 644 "$TARGET/etc/resolv.conf" 2>/dev/null || true
 
 touch "$TARGET$CHROOT_MARKER"
 sync
 sleep 0.3  # 等待 mount propagation 稳定
 echo_info "挂载同步完成，准备执行 chroot 预检"
 prepare_chroot_compat
-CHROOT_EXEC_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:/apex/com.android.runtime/bin:/android_root/system/bin:/android_root/system/xbin:/android_root/apex/com.android.runtime/bin"
+CHROOT_EXEC_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:/apex/com.android.runtime/bin"
 ROOTFS_PRECHECK_SHELL="$(get_rootfs_chroot_shell)"
-ROOTFS_PRECHECK_OUT="$(HOME=/root PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$ROOTFS_PRECHECK_SHELL" -c 'echo pre_sshd_ok' 2>&1 || true)"
+ROOTFS_PRECHECK_OUT="$(HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$ROOTFS_PRECHECK_SHELL" -c 'echo pre_sshd_ok' 2>&1 || true)"
 PRE_SSHD_LAST_OUTPUT="$ROOTFS_PRECHECK_OUT"
 if printf '%s' "$ROOTFS_PRECHECK_OUT" | grep -qx 'pre_sshd_ok'; then
   echo_info "sshd前 chroot 自检成功 (shell=$ROOTFS_PRECHECK_SHELL)"
@@ -2575,7 +3927,7 @@ if [ "$DAEMON_MODE" -eq 1 ]; then
   [ "$SSHD_PRESENT" -eq 1 ] || echo_err "后台模式需要 rootfs 内已安装并可执行的 sshd（请先安装 openssh-server）"
   [ "$SSHD_RUNNING" -eq 1 ] || echo_err "后台模式启动失败：未确认 chroot 内 sshd 存活，请查看日志: $LOG_FILE"
   daemon_name="${DISTRO_NAME:-$(basename "$TARGET")}" 
-  DAEMON_INFO_FILE="/data/data/com.termux/files/usr/tmp/chroot-mcp-daemon-${daemon_name}.info"
+  DAEMON_INFO_FILE="$STATE_DIR/chroot-mcp-daemon-${daemon_name}.info"
   cat > "$DAEMON_INFO_FILE" <<EOF
 TARGET=$TARGET
 PORT=${ROOTFS_SSHD_PORT:-unknown}
@@ -2586,7 +3938,10 @@ IMAGE_FILE=${IMAGE_FILE:-}
 IMAGE_LOOPDEV=${IMAGE_LOOPDEV:-}
 EOF
   echo_info "🛰 后台模式已启动，不进入交互shell"
-  echo_info "   SSH: root@<手机IP> -p ${ROOTFS_SSHD_PORT:-unknown}"
+  echo_info "   SSH: ssh root@<手机IP> -p ${ROOTFS_SSHD_PORT:-unknown}"
+  echo_info "   SFTP: sftp -P ${ROOTFS_SSHD_PORT:-unknown} root@<手机IP>"
+  echo_info "   用户名: root"
+  echo_info "   密码: ${MCP_ROOT_PASSWORD:-123456}"
   echo_info "   sshd PID: ${ROOTFS_SSHD_PID:-unknown}"
   echo_info "   状态文件: $DAEMON_INFO_FILE"
   echo_info "   日志文件: $LOG_FILE"
@@ -2595,11 +3950,9 @@ EOF
 fi
 
 echo_info "✅ 环境构建完成"
-echo_info "   /data            -> Android /data [默认rw；若 rootfs 位于 /data 下则安全等效映射到 /android_data；--safe 或 --ro-data 可只读]"
+echo_info "   /data            -> Android /data [默认rw；--safe 或 --ro-data 可只读]"
 echo_info "   /system,/vendor,/product,/odm,/system_ext,/apex,/metadata -> Android标准路径 [默认ro]"
-echo_info "   /storage/emulated/0 -> 内置存储 [默认rw；--safe 可只读]"
-echo_info "   /android_root    -> 宿主 / [兼容别名，默认ro]"
-echo_info "   /android_data,/android_system... -> 兼容别名，建议优先使用标准Android路径"
+echo_info "   /storage/emulated/0,/sdcard -> 内置存储 [默认rw；--safe 可只读]"
 echo_info "   /dev             -> 完整设备节点"
 echo_info "提示: 修改系统前手动 remount,rw，用完 remount,ro；若追求稳妥可加 --safe"
 
@@ -2607,10 +3960,10 @@ echo_info "🚀 进入Ubuntu chroot，exit 可安全退出"
 
 cd "$TARGET" || echo_err "切换到chroot根目录失败"
 if [ -x "$TARGET/usr/bin/run-parts" ] || [ -x "$TARGET/bin/run-parts" ]; then
-  HOME=/root TERM="${TERM:-xterm-256color}" PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" /bin/bash -l
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" /bin/bash -l
 else
   echo_warn "rootfs内缺少 run-parts，跳过login shell初始化以避免报错（可在容器内安装 debianutils 后恢复 -l）"
-  HOME=/root TERM="${TERM:-xterm-256color}" PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" /bin/bash
+  HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" /bin/bash
 fi
 rc=$?
 if [ "$rc" -ne 0 ]; then
