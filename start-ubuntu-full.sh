@@ -3,7 +3,12 @@
 set -u
 set -o pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${0}"
+case "$SCRIPT_PATH" in
+  /*) ;;
+  *) SCRIPT_PATH="$(pwd)/$SCRIPT_PATH" ;;
+esac
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd -P)"
 TARGET_SCRIPT="$SCRIPT_DIR/chroot-mcp-safe.sh"
 
 if [ ! -x "$TARGET_SCRIPT" ]; then

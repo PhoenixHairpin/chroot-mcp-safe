@@ -1145,6 +1145,102 @@ first_pid_from_list() {
   [ $# -gt 0 ] && echo "$1"
 }
 
+ENTER_EXISTING_METHOD=""
+ENTER_EXISTING_SHELL=""
+ENTER_EXISTING_LAST_OUTPUT=""
+
+compact_one_line() {
+  printf '%s' "$1" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+nsenter_supports_root_dir() {
+  "$NSENTER_BIN" --help 2>&1 | grep -Eq '(^|[[:space:]])(-r,|--root)([^[:alnum:]_-]|$)'
+}
+
+nsenter_supports_wd_dir() {
+  "$NSENTER_BIN" --help 2>&1 | grep -Eq '(^|[[:space:]])(-w,|--wd)([^[:alnum:]_-]|$)'
+}
+
+probe_nsenter_root_shell() {
+  local ns_pid="$1"
+  local shell output rc combined=""
+  local wd_args=()
+
+  ENTER_EXISTING_METHOD=""
+  ENTER_EXISTING_SHELL=""
+  ENTER_EXISTING_LAST_OUTPUT=""
+
+  if ! nsenter_supports_root_dir; then
+    ENTER_EXISTING_LAST_OUTPUT="nsenter 不支持 --root/-r"
+    return 1
+  fi
+
+  nsenter_supports_wd_dir && wd_args=(--wd=/)
+
+  for shell in /usr/bin/bash /bin/bash /usr/bin/dash /bin/dash /usr/bin/ash /bin/ash /usr/bin/sh /bin/sh; do
+    output=$(HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+      "$NSENTER_BIN" -t "$ns_pid" -m -r "${wd_args[@]}" -- "$shell" -c "cd / 2>/dev/null || true; echo enter_probe_ok shell=$shell" 2>&1)
+    rc=$?
+    combined="${combined}${combined:+ ; }${shell}:rc=${rc}:$(compact_one_line "$output")"
+    if [ "$rc" -eq 0 ] && printf '%s\n' "$output" | grep -q '^enter_probe_ok shell='; then
+      ENTER_EXISTING_METHOD="nsenter-root"
+      ENTER_EXISTING_SHELL="$shell"
+      ENTER_EXISTING_LAST_OUTPUT="$output"
+      return 0
+    fi
+  done
+
+  ENTER_EXISTING_LAST_OUTPUT="$combined"
+  return 1
+}
+
+probe_target_chroot_shell() {
+  local ns_pid="$1"
+  local target="$2"
+  local output rc
+
+  ENTER_EXISTING_METHOD=""
+  ENTER_EXISTING_SHELL=""
+  ENTER_EXISTING_LAST_OUTPUT=""
+
+  output=$("$NSENTER_BIN" -t "$ns_pid" -m -- "$SH_BIN" -c '
+target="$1"
+chroot_bin="$2"
+target_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[ -d "$target" ] || { echo "target_not_found: $target"; exit 10; }
+cd "$target" || { echo "target_cd_failed: $target"; exit 11; }
+
+last=""
+for shell in /usr/bin/bash /bin/bash /usr/bin/dash /bin/dash /usr/bin/ash /bin/ash /usr/bin/sh /bin/sh; do
+  [ -e ".$shell" ] || [ -L ".$shell" ] || continue
+  out=$(HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" PATH="$target_path" \
+    "$chroot_bin" . "$shell" -c "cd / 2>/dev/null || true; echo enter_probe_ok shell=$shell" 2>&1)
+  rc=$?
+  if [ "$rc" -eq 0 ] && printf "%s\n" "$out" | grep -q "^enter_probe_ok shell="; then
+    echo "enter_probe_ok shell=$shell"
+    exit 0
+  fi
+  out=$(printf "%s" "$out" | tr "\n" " " | sed "s/[[:space:]]\+/ /g; s/^ //; s/ $//")
+  last="${last}${last:+ ; }${shell}:rc=${rc}:${out}"
+done
+
+[ -n "$last" ] && echo "$last" || echo "no_candidate_shell_in_target: $target"
+exit 12
+' sh "$target" "$CHROOT_BIN" 2>&1)
+  rc=$?
+  ENTER_EXISTING_LAST_OUTPUT="$output"
+  if [ "$rc" -eq 0 ] && printf '%s\n' "$output" | grep -q '^enter_probe_ok shell='; then
+    ENTER_EXISTING_METHOD="target-chroot"
+    ENTER_EXISTING_SHELL="$(printf '%s\n' "$output" | sed -n 's/^enter_probe_ok shell=//p' | head -1)"
+    [ -n "$ENTER_EXISTING_SHELL" ] || ENTER_EXISTING_SHELL="/bin/sh"
+    return 0
+  fi
+
+  return 1
+}
+
 enter_existing_container() {
   local ns_pid="$1"
   local target="$2"
@@ -1153,13 +1249,47 @@ enter_existing_container() {
   [ -n "$target" ] || echo_err "直接进入失败：缺少目标 rootfs"
   [ -d "/proc/$ns_pid" ] || echo_err "直接进入失败：目标 pid 不存在: $ns_pid"
 
-  echo_info "直接进入已运行容器: pid=$ns_pid target=$target"
+  local root_probe=""
+  local chroot_probe=""
+  local wd_args=()
 
-  # 优先用 rootfs 自带的 bash；若 rootfs 没 bash（alpine/arch 默认），退回 /bin/sh
-  local in_shell="/bin/bash"
-  [ -x "$target/bin/bash" ] || in_shell="/bin/sh"
-  "$NSENTER_BIN" -t "$ns_pid" -m "$SH_BIN" -c \
-    "cd '$target' && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin $CHROOT_BIN . $in_shell -i"
+  if ! probe_nsenter_root_shell "$ns_pid"; then
+    root_probe="$ENTER_EXISTING_LAST_OUTPUT"
+    if ! probe_target_chroot_shell "$ns_pid" "$target"; then
+      chroot_probe="$ENTER_EXISTING_LAST_OUTPUT"
+      echo_warn "直接进入探测失败：pid=$ns_pid target=$target"
+      echo_warn "  nsenter-root: $(compact_one_line "$root_probe")"
+      echo_warn "  target-chroot: $(compact_one_line "$chroot_probe")"
+      echo_warn "运行态可能已半损坏或 rootfs 镜像发生 I/O 错误；请先在菜单选择 \"终止容器\"，再重新 \"启动 / 安装容器\"。"
+      return 126
+    fi
+  fi
+
+  echo_info "直接进入已运行容器: pid=$ns_pid target=$target method=$ENTER_EXISTING_METHOD shell=$ENTER_EXISTING_SHELL"
+
+  case "$ENTER_EXISTING_METHOD" in
+    nsenter-root)
+      nsenter_supports_wd_dir && wd_args=(--wd=/)
+      HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" \
+        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+        "$NSENTER_BIN" -t "$ns_pid" -m -r "${wd_args[@]}" -- "$ENTER_EXISTING_SHELL" -c 'cd / 2>/dev/null || true; exec "$0" -i' "$ENTER_EXISTING_SHELL"
+      ;;
+    target-chroot)
+      "$NSENTER_BIN" -t "$ns_pid" -m -- "$SH_BIN" -c '
+target="$1"
+shell="$2"
+chroot_bin="$3"
+cd "$target" || exit 125
+HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp TERM="${TERM:-xterm-256color}" \
+  PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+  exec "$chroot_bin" . "$shell" -c '"'"'cd / 2>/dev/null || true; exec "$0" -i'"'"' "$shell"
+' sh "$target" "$ENTER_EXISTING_SHELL" "$CHROOT_BIN"
+      ;;
+    *)
+      echo_warn "未知进入方式: ${ENTER_EXISTING_METHOD:-empty}"
+      return 126
+      ;;
+  esac
 }
 
 
