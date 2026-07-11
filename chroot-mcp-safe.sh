@@ -1,4 +1,5 @@
 #!/system/bin/sh
+# shellcheck shell=bash disable=SC1111
 # Portable launcher: ensure bash regardless of caller (termux / tsu / su / MT 管理器)
 if [ -z "${BASH_VERSION:-}" ]; then
   for _b in /data/data/com.termux/files/usr/bin/bash /system/bin/bash /system/xbin/bash /sbin/bash /bin/bash; do
@@ -15,8 +16,6 @@ set -o pipefail
 # 运行时环境识别（兼容 termux/tsu/非termux的MT管理器/裸su）
 # ==============================================
 TERMUX_PREFIX="/data/data/com.termux/files/usr"
-HAVE_TERMUX=0
-[ -d "$TERMUX_PREFIX" ] && HAVE_TERMUX=1
 export PATH="$TERMUX_PREFIX/bin:$TERMUX_PREFIX/sbin:/system/bin:/system/xbin:/vendor/bin:/sbin:/bin:$PATH"
 
 _find_bin() {
@@ -67,9 +66,9 @@ chmod 755 "$PORT_CONFIG_DIR" 2>/dev/null || true
 # ==============================================
 # chroot-mcp-safe.sh - Android chroot 容器管理脚本
 # ==============================================
-# 版本: v2.1.1 (Safe Edition)
-# 日期: 2026-04-11
-# 状态: ✅ 生产可用 (已验证稳定运行)
+# 版本: v2.2.1 (Agent-Enhanced Edition)
+# 日期: 2026-07-11
+# 状态: 已通过语法、ShellCheck 与 Android Binder 命令验证
 # ==============================================
 # 本版本新增功能 (相比 v2.0):
 #   1. ✅ Android 二进制支持: apex 使用 rbind 递归挂载
@@ -110,10 +109,10 @@ PRINT_INSTALL_GUIDE=0
 INTERACTIVE_MODE=0
 LOG_FILE="${LOG_FILE:-$STATE_DIR/chroot-mcp-$(date +%s).log}"
 
-HOST_ROOT_OPT="ro"
 SYS_MOUNT_OPT="ro,nosuid"
 DATA_MOUNT_OPT="rw"
 SDCARD_MOUNT_OPT="rw"
+ANDROID_BIN_PATH="/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin"
 
 CHROOT_MARKER="/.chroot_marker"
 MOUNT_STACK=()
@@ -182,7 +181,8 @@ get_default_distro_sshd_port() {
 # 统一日志函数：前置流程也会调用 echo_warn/echo_info。
 # echo_err 在 cleanup 已定义后会自动触发清理；更早阶段仅记录错误并退出。
 log() {
-  local content="[$(date '+%H:%M:%S')] $1"
+  local content
+  content="[$(date '+%H:%M:%S')] $1"
   mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
   echo -e "$content" | tee -a "$LOG_FILE"
 }
@@ -782,7 +782,7 @@ daemon_status() {
 
 collect_mountpoint_users_in_current_ns() {
   local mp="$1"
-  local p pid link hit=0
+  local p pid link
   for p in /proc/[0-9]*; do
     pid="${p##*/}"
     for what in root cwd exe; do
@@ -791,7 +791,6 @@ collect_mountpoint_users_in_current_ns() {
       case "$link" in
         "$mp"|"$mp"/*)
           echo "$pid"
-          hit=1
           break
           ;;
       esac
@@ -1044,6 +1043,15 @@ for m in \
   "$TARGET/sys/kernel/tracing" \
   "$TARGET/sys/kernel/debug" \
   "$TARGET/mi_ext" \
+  "$TARGET/my_engineering" \
+  "$TARGET/my_carrier" \
+  "$TARGET/my_region" \
+  "$TARGET/my_product" \
+  "$TARGET/cust" \
+  "$TARGET/oem" \
+  "$TARGET/odm_dlkm" \
+  "$TARGET/system_dlkm" \
+  "$TARGET/vendor_dlkm" \
   "$TARGET/mnt" \
   "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
@@ -1336,6 +1344,15 @@ for m in \
   "$TARGET/sys/kernel/tracing" \
   "$TARGET/sys/kernel/debug" \
   "$TARGET/mi_ext" \
+  "$TARGET/my_engineering" \
+  "$TARGET/my_carrier" \
+  "$TARGET/my_region" \
+  "$TARGET/my_product" \
+  "$TARGET/cust" \
+  "$TARGET/oem" \
+  "$TARGET/odm_dlkm" \
+  "$TARGET/system_dlkm" \
+  "$TARGET/vendor_dlkm" \
   "$TARGET/mnt" \
   "$TARGET/data_mirror" \
   "$TARGET/storage/emulated/0" \
@@ -2192,7 +2209,8 @@ fetch_rootfs_via_proot_distro() {
       [ "$override_created" -eq 1 ] && echo_info "已写入临时 override 跳过 distro_setup: $pd_override_plugin"
     fi
 
-    local install_log="$STATE_DIR/proot-distro-install-${pd_alias}-$(date +%s).log"
+    local install_log
+    install_log="$STATE_DIR/proot-distro-install-${pd_alias}-$(date +%s).log"
     /data/data/com.termux/files/usr/bin/proot-distro install "$pd_alias" 2>&1 | tee "$install_log" >&2
     local rc=${PIPESTATUS[0]}
 
@@ -2476,7 +2494,6 @@ interactive_wizard() {
   local action distro url existing_rootfs stop_distro stop_confirm image_size_input resize_confirm
   local enter_distro enter_file enter_rootfs enter_pids enter_pid enter_target
   local source_choice advanced advanced_choice
-  local install_disto rootfs_input
 
   show_all_containers_status
 
@@ -2508,7 +2525,7 @@ interactive_wizard() {
       ;;
 
     "删除已下载容器")
-      local rm_distro rm_confirm
+      local rm_distro
       rm_distro=$(choose_option "删除哪个发行版" ubuntu debian arch fedora alpine)
       DISTRO_NAME="$rm_distro"
       remove_distro_assets "$rm_distro"
@@ -3000,6 +3017,56 @@ EOF
   fi
 }
 
+install_android_command_wrapper() {
+  local name="$1"
+  local source="/system/bin/$name"
+  local destination="$TARGET/usr/local/bin/$name"
+
+  [ -e "$source" ] || return 0
+  mkdir -p "$TARGET/usr/local/bin" 2>/dev/null || return 1
+
+  if [ -e "$destination" ] && ! grep -Fq '# chroot-mcp-safe: android-command-wrapper' "$destination" 2>/dev/null; then
+    echo_warn "保留 rootfs 已有命令，不覆盖: /usr/local/bin/$name"
+    return 0
+  fi
+
+  cat > "$destination" <<EOF
+#!/bin/sh
+# chroot-mcp-safe: android-command-wrapper
+export PATH="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:$ANDROID_BIN_PATH"
+exec "$source" "\$@"
+EOF
+  chmod 755 "$destination" 2>/dev/null || return 1
+}
+
+prepare_android_runtime_env() {
+  local profile="$TARGET/etc/profile.d/chroot-mcp-android.sh"
+  local name
+
+  mkdir -p "$TARGET/etc/profile.d" "$TARGET/usr/local/bin" 2>/dev/null \
+    || echo_err "无法创建 Android 运行环境目录"
+  cat > "$profile" <<EOF
+# Managed by chroot-mcp-safe.sh.
+ANDROID_BIN_PATH="$ANDROID_BIN_PATH"
+case ":\${PATH:-}:" in
+  *:/system/bin:*) ;;
+  *) export PATH="\${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}:\$ANDROID_BIN_PATH" ;;
+esac
+export ANDROID_DATA=/data
+export ANDROID_ROOT=/system
+export ANDROID_ART_ROOT=/apex/com.android.art
+export ANDROID_I18N_ROOT=/apex/com.android.i18n
+export ANDROID_TZDATA_ROOT=/apex/com.android.tzdata
+unset ANDROID_BIN_PATH
+EOF
+  chmod 644 "$profile" 2>/dev/null || echo_err "无法设置 Android 环境文件权限"
+
+  for name in am dumpsys cmd settings pm getprop input appops content ime monkey screencap screenrecord svc wm; do
+    install_android_command_wrapper "$name" \
+      || echo_warn "无法安装 Android 命令包装器: $name"
+  done
+}
+
 # ==============================================
 # sshd 准备 / chroot 执行与诊断
 # ==============================================
@@ -3115,9 +3182,10 @@ _mcp_main_includes_dropin_dir() {
 ensure_rootfs_sshd_dropin() {
   local cfg="$TARGET/etc/ssh/sshd_config"
   local drop_dir="$TARGET/etc/ssh/sshd_config.d"
-  local drop="$(_mcp_drop_in_path)"
+  local drop
   local want_port
 
+  drop="$(_mcp_drop_in_path)"
   want_port="$(resolve_sshd_port)"
   [ -n "$want_port" ] || echo_err "端口分配失败"
   ROOTFS_SSHD_PORT="$want_port"
@@ -3235,9 +3303,10 @@ ensure_rootfs_root_password() {
 
 get_rootfs_sshd_port() {
   local cfg="$TARGET/etc/ssh/sshd_config"
-  local drop="$(_mcp_drop_in_path)"
+  local drop
   local port=""
 
+  drop="$(_mcp_drop_in_path)"
   if [ -f "$drop" ]; then
     port=$(awk '
       /^[[:space:]]*#/ {next}
@@ -3259,7 +3328,6 @@ get_rootfs_sshd_port() {
 ROOTFS_CHROOT_SHELL=""
 CHROOT_LAST_OUTPUT=""
 
-PRE_SSHD_LAST_OUTPUT=""
 log_diag_block() {
   local tag="$1"
   while IFS= read -r line; do
@@ -3944,6 +4012,16 @@ do_mount "$REAL_SYSTEM_EXT" "$TARGET/system_ext" "bind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_APEX" "$TARGET/apex" "rbind" "$SYS_MOUNT_OPT"
 do_mount "$REAL_METADATA" "$TARGET/metadata" "bind" "$SYS_MOUNT_OPT"
 
+# Android 设备可选的动态内核模块与厂商分区。只映射实际存在的目录，
+# 并统一保持只读，避免为设备差异维护脆弱的机型判断。
+for _android_partition in \
+  vendor_dlkm system_dlkm odm_dlkm oem cust \
+  my_product my_region my_carrier my_engineering; do
+  if [ -d "/$_android_partition" ]; then
+    do_mount "/$_android_partition" "$TARGET/$_android_partition" "bind" "ro,nosuid"
+  fi
+done
+
 # 添加 linkerconfig 以支持 Android 动态链接器配置
 if [ -d "/linkerconfig" ]; then
   do_mount "/linkerconfig" "$TARGET/linkerconfig" "bind" "ro"
@@ -4041,10 +4119,10 @@ sync
 sleep 0.3  # 等待 mount propagation 稳定
 echo_info "挂载同步完成，准备执行 chroot 预检"
 prepare_chroot_compat
-CHROOT_EXEC_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/system/bin:/system/xbin:/apex/com.android.runtime/bin"
+prepare_android_runtime_env
+CHROOT_EXEC_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$ANDROID_BIN_PATH"
 ROOTFS_PRECHECK_SHELL="$(get_rootfs_chroot_shell)"
 ROOTFS_PRECHECK_OUT="$(HOME=/root TMPDIR=/tmp TMP=/tmp TEMP=/tmp PATH="$CHROOT_EXEC_PATH" "$CHROOT_BIN" "$TARGET" "$ROOTFS_PRECHECK_SHELL" -c 'echo pre_sshd_ok' 2>&1 || true)"
-PRE_SSHD_LAST_OUTPUT="$ROOTFS_PRECHECK_OUT"
 if printf '%s' "$ROOTFS_PRECHECK_OUT" | grep -qx 'pre_sshd_ok'; then
   echo_info "sshd前 chroot 自检成功 (shell=$ROOTFS_PRECHECK_SHELL)"
 else
